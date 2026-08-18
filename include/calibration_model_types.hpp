@@ -12,6 +12,12 @@ enum class CalibrationPartition : uint8_t {
   FinalValidation,
 };
 
+struct CalibrationFeatureSchema {
+  uint32_t schema_id = 0;
+  uint16_t version = 0;
+  uint8_t feature_count = 0;
+};
+
 enum class CalibrationBinaryTarget : int8_t {
   Ignore = -1,
   Negative = 0,
@@ -21,6 +27,8 @@ enum class CalibrationBinaryTarget : int8_t {
 enum class CalibrationTrainingStatus : uint8_t {
   Ok = 0,
   InvalidArgument,
+  FeatureSchemaRequired,
+  FeatureSchemaLocked,
   DuplicateSessionId,
   RunCapacityReached,
   RunNotFound,
@@ -86,6 +94,7 @@ struct CalibrationLogisticHead {
 
 struct CalibratedDetectionModel {
   bool ready = false;
+  CalibrationFeatureSchema feature_schema{};
   uint8_t feature_count = 0;
   uint16_t training_samples = 0;
   float feature_mean[kCalibrationMaxFeatures]{};

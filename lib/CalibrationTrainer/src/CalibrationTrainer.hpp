@@ -27,6 +27,8 @@ class CalibrationTrainer {
   void configure(const CalibrationTrainerConfig& config);
   void reset();
 
+  CalibrationTrainingStatus bindFeatureSchema(
+      const CalibrationFeatureSchema& schema);
   CalibrationTrainingStatus registerRun(
       const CalibrationRunDescriptor& descriptor);
   CalibrationTrainingStatus appendSample(
@@ -99,4 +101,5 @@ class CalibrationTrainer {
   uint8_t run_count_ = 0;
   uint16_t sample_count_ = 0;
   uint8_t feature_count_ = 0;
+  CalibrationFeatureSchema feature_schema_{};
 };
