@@ -7,6 +7,7 @@
 #include <CalibratedModelRuntime.hpp>
 #include <CalibrationStorage.hpp>
 #include <CalibrationBootstrap.hpp>
+#include <CalibrationStartupController.hpp>
 #include <AdaptiveTemporalEncoder.hpp>
 #include <EspNowTransport.hpp>
 #include <FeatureExtractor.hpp>
