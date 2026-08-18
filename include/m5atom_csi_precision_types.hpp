@@ -9,7 +9,7 @@
 namespace atom::radar {
 
 constexpr std::size_t kMaximumM5AtomCsiReceivers = 3;
-constexpr std::size_t kCsiObservationMetricCount = 18;
+constexpr std::size_t kCsiObservationMetricCount = 19;
 constexpr uint8_t kCsiObservationPacketType = 0x43U;
 
 enum class CsiPrecisionUpdateStatus : uint8_t {
@@ -29,6 +29,8 @@ struct M5AtomCsiPrecisionConfig {
   int64_t probe_match_tolerance_us{6500};
   int64_t fusion_freshness_us{500000};
   int64_t fusion_alignment_us{250000};
+  uint8_t maximum_sequence_skew{2};
+  float minimum_window_overlap{0.60F};
   float amplitude_std_floor{0.025F};
   float phase_noise_floor_rad{0.035F};
   float ratio_noise_floor{0.040F};
@@ -44,12 +46,15 @@ struct CsiLinkObservation {
   uint8_t channel;
   uint8_t bandwidth_mhz;
   uint32_t probe_sequence;
+  uint32_t window_start_probe_sequence;
   uint32_t observation_sequence;
   uint64_t tx_uptime_us;
   uint16_t frames_in_summary;
+  uint16_t expected_frames_in_summary;
   uint16_t sequence_gap_count;
   float snr_db;
   float valid_ratio;
+  float window_completeness;
   float subcarrier_reliability;
   float baseline_maturity;
   float amplitude_motion;
@@ -90,12 +95,14 @@ struct FusedCsiObservation {
   float baseline_shift;
   float broadband_nuisance;
   float link_agreement;
+  float synchronization_quality;
   float quality;
   bool physically_observable;
 };
 
 enum class CsiObservationMetric : std::size_t {
   ValidRatio = 0,
+  WindowCompleteness,
   SubcarrierReliability,
   BaselineMaturity,
   AmplitudeMotion,
@@ -126,9 +133,11 @@ struct CsiObservationPacket {
   uint8_t channel;
   uint8_t bandwidth_mhz;
   uint32_t probe_sequence;
+  uint32_t window_start_probe_sequence;
   uint64_t tx_uptime_us;
   uint32_t observation_sequence;
   uint16_t frames_in_summary;
+  uint16_t expected_frames_in_summary;
   uint16_t sequence_gap_count;
   int16_t snr_db_x10;
   uint8_t flags;
