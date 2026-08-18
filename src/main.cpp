@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <cstring>
 #include <CsiCapture.hpp>
 #include <CsiFrameParser.hpp>
 #include <CsiPreprocessor.hpp>
@@ -13,6 +14,7 @@
 #include <FeatureExtractor.hpp>
 #include <LocalDetector.hpp>
 #include <LocalStateMachine.hpp>
+#include <M5AtomCsiPrecision.hpp>
 #include <M5Unified.h>
 #include <Preferences.h>
 #include <RadioController.hpp>
@@ -69,10 +71,16 @@ static atom::radar::EspNowTransport g_esp_now;
 static atom::radar::FeatureExtractor g_feature_extractor;
 static atom::radar::LocalDetector g_local_detector;
 static atom::radar::LocalStateMachine g_local_state_machine;
+static atom::radar::M5AtomCsiLinkProcessor g_m5atom_csi_processor;
+static atom::radar::M5AtomCsiFusion g_m5atom_csi_fusion;
 static atom::radar::RadioController g_radio;
 static atom::radar::SubcarrierSelection g_subcarrier_selection{};
 static bool g_pairing_ready = false;
 static uint32_t g_system_id = 0;
+static uint8_t g_coordinator_mac[atom::radar::kWifiMacLength]{};
+static atom::radar::CsiObservationPacket g_pending_csi_observation{};
+static int64_t g_pending_csi_observation_at_us = 0;
+static bool g_has_pending_csi_observation = false;
 
 struct PairingConfig {
   uint32_t system_id;
@@ -100,6 +108,15 @@ struct CsiProcessingCounters {
   uint32_t feature_updates;
   uint32_t selection_required_frames;
   uint32_t local_detection_updates;
+  uint32_t precision_updates;
+  uint32_t precision_collecting_frames;
+  uint32_t precision_unmatched_frames;
+  uint32_t observation_packets_queued;
+  uint32_t observation_packets_replaced;
+  uint32_t observation_packets_sent;
+  uint32_t observation_packet_send_errors;
+  uint32_t fused_observations;
+  uint32_t fusion_rejects;
 };
 
 static CsiProcessingCounters g_csi_processing_counters{};
@@ -189,6 +206,9 @@ static void setupReceiverRole(const RuntimeConfig &cfg) {
   const PairingConfig pairing = loadPairingConfig();
   g_system_id = pairing.system_id;
   g_pairing_ready = pairing.has_coordinator_mac;
+  if (g_pairing_ready) {
+    std::memcpy(g_coordinator_mac, pairing.coordinator_mac, atom::radar::kWifiMacLength);
+  }
 
   const atom::radar::RadioConfig radio_config = buildRadioConfig();
   esp_err_t result = g_radio.begin(radio_config);
@@ -297,6 +317,7 @@ static void serviceReceiverPackets() {
 
     g_has_probe_sequence = true;
     g_last_probe_sequence = probe.sequence;
+    g_m5atom_csi_processor.noteProbe(probe.sequence, probe.tx_uptime_us, frame.received_at_us);
     ++g_probe_receive_counters.accepted;
   }
 
@@ -329,6 +350,30 @@ static void serviceReceiverCapture() {
       continue;
     }
     ++g_csi_processing_counters.parsed_frames;
+
+    atom::radar::CsiLinkObservation precision_observation{};
+    const atom::radar::CsiPrecisionUpdateStatus precision_status =
+        g_m5atom_csi_processor.update(parsed, static_cast<uint8_t>(NODE_ID), precision_observation);
+    if (precision_status == atom::radar::CsiPrecisionUpdateStatus::Updated) {
+      ++g_csi_processing_counters.precision_updates;
+      if (g_pairing_ready) {
+        if (g_has_pending_csi_observation) {
+          ++g_csi_processing_counters.observation_packets_replaced;
+        }
+        g_pending_csi_observation =
+            atom::radar::makeCsiObservationPacket(g_system_id, precision_observation);
+        g_pending_csi_observation_at_us =
+            parsed.received_at_us + 1000LL + static_cast<int64_t>(NODE_ID) * 2000LL;
+        g_has_pending_csi_observation = true;
+        ++g_csi_processing_counters.observation_packets_queued;
+      }
+    } else if (precision_status == atom::radar::CsiPrecisionUpdateStatus::Collecting ||
+               precision_status == atom::radar::CsiPrecisionUpdateStatus::CollectingBaseline) {
+      ++g_csi_processing_counters.precision_collecting_frames;
+    } else if (precision_status == atom::radar::CsiPrecisionUpdateStatus::UnmatchedProbe ||
+               precision_status == atom::radar::CsiPrecisionUpdateStatus::NonMonotonicProbe) {
+      ++g_csi_processing_counters.precision_unmatched_frames;
+    }
 
     atom::radar::PreprocessedCsiFrame preprocessed{};
     const atom::radar::CsiPreprocessStatus preprocess_status =
@@ -394,6 +439,68 @@ static void serviceReceiverCapture() {
       g_pairing_ready ? "true" : "false");
 }
 
+static void serviceReceiverObservationTx() {
+  if (!g_has_pending_csi_observation || !g_pairing_ready) {
+    return;
+  }
+  const int64_t now_us = esp_timer_get_time();
+  if (now_us < g_pending_csi_observation_at_us || g_esp_now.sendPending()) {
+    return;
+  }
+  const esp_err_t result =
+      g_esp_now.send(g_coordinator_mac, &g_pending_csi_observation,
+                     sizeof(g_pending_csi_observation), now_us);
+  if (result == ESP_OK) {
+    g_has_pending_csi_observation = false;
+    ++g_csi_processing_counters.observation_packets_sent;
+  } else if (result != ESP_ERR_INVALID_STATE) {
+    g_has_pending_csi_observation = false;
+    ++g_csi_processing_counters.observation_packet_send_errors;
+  }
+}
+
+static void serviceCoordinatorObservations() {
+  atom::radar::EspNowFrame frame{};
+  while (g_esp_now.receive(frame)) {
+    if (g_m5atom_csi_fusion.ingestPacket(frame.data, frame.length, g_system_id,
+                                         frame.received_at_us)) {
+      ++g_csi_processing_counters.fused_observations;
+    } else {
+      ++g_csi_processing_counters.fusion_rejects;
+    }
+  }
+
+  static int64_t last_report_us = 0;
+  const int64_t now_us = esp_timer_get_time();
+  if (now_us - last_report_us < 1000000) {
+    return;
+  }
+  last_report_us = now_us;
+
+  atom::radar::FusedCsiObservation observation{};
+  if (!g_m5atom_csi_fusion.snapshot(now_us, observation)) {
+    Serial.printf("{\"type\":\"csi_fusion\",\"active_links\":0,\"accepted\":%lu,"
+                  "\"rejected\":%lu}\r\n",
+                  static_cast<unsigned long>(g_csi_processing_counters.fused_observations),
+                  static_cast<unsigned long>(g_csi_processing_counters.fusion_rejects));
+    return;
+  }
+
+  Serial.printf(
+      "{\"type\":\"csi_fusion\",\"active_links\":%u,\"quality\":%.3f,"
+      "\"agreement\":%.3f,\"amplitude\":%.3f,\"phase\":%.3f,"
+      "\"complex_ratio\":%.3f,\"doppler\":%.3f,\"respiration\":%.3f,"
+      "\"respiration_coherence\":%.3f,\"impulse\":%.3f,\"stillness\":%.3f,"
+      "\"baseline_shift\":%.3f,\"broadband_nuisance\":%.3f,"
+      "\"physically_observable\":%s}\r\n",
+      observation.active_links, observation.quality, observation.link_agreement,
+      observation.amplitude_motion, observation.differential_phase_motion,
+      observation.complex_ratio_motion, observation.doppler_energy,
+      observation.respiration_power, observation.respiration_coherence,
+      observation.impulse_score, observation.stillness_score, observation.baseline_shift,
+      observation.broadband_nuisance, observation.physically_observable ? "true" : "false");
+}
+
 void setup() {
   Serial.begin(115200);
   delay(100);
@@ -414,6 +521,7 @@ void loop() {
   M5.update();
   if (NODE_ROLE == static_cast<uint8_t>(NodeRole::TxCoordinator)) {
     if (g_esp_now.started()) {
+      serviceCoordinatorObservations();
       serviceCoordinatorProbes();
     }
   } else {
@@ -422,6 +530,9 @@ void loop() {
     }
     if (g_csi_capture.started()) {
       serviceReceiverCapture();
+    }
+    if (g_esp_now.started()) {
+      serviceReceiverObservationTx();
     }
   }
   delay(2);
