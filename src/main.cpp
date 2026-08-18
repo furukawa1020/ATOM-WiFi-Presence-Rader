@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <CsiCapture.hpp>
+#include <CsiFrameParser.hpp>
+#include <CsiPreprocessor.hpp>
 #include <EspNowTransport.hpp>
 #include <M5Unified.h>
 #include <Preferences.h>
@@ -50,6 +52,8 @@ struct RuntimeConfig {
 
 static constexpr const char *kRoleNames[] = {"TX_COORDINATOR", "RECEIVER"};
 static atom::radar::CsiCapture g_csi_capture;
+static atom::radar::CsiFrameParser g_csi_parser;
+static atom::radar::CsiPreprocessor g_csi_preprocessor;
 static atom::radar::EspNowTransport g_esp_now;
 static atom::radar::RadioController g_radio;
 static bool g_pairing_ready = false;
@@ -71,6 +75,16 @@ struct ProbeReceiveCounters {
 static ProbeReceiveCounters g_probe_receive_counters{};
 static bool g_has_probe_sequence = false;
 static uint32_t g_last_probe_sequence = 0;
+
+struct CsiProcessingCounters {
+  uint32_t parsed_frames;
+  uint32_t parse_rejects;
+  uint32_t preprocessed_frames;
+  uint32_t baseline_required_frames;
+  uint32_t preprocess_rejects;
+};
+
+static CsiProcessingCounters g_csi_processing_counters{};
 
 static RuntimeConfig buildRuntimeConfig() {
   RuntimeConfig cfg{};
@@ -191,7 +205,7 @@ static void setupReceiverRole(const RuntimeConfig &cfg) {
   Serial.printf("CSI capture ready for Coordinator %02X:%02X:%02X:%02X:%02X:%02X\r\n",
                 pairing.coordinator_mac[0], pairing.coordinator_mac[1], pairing.coordinator_mac[2],
                 pairing.coordinator_mac[3], pairing.coordinator_mac[4], pairing.coordinator_mac[5]);
-  showStatus("CSI CAPTURE", "READY", TFT_WHITE);
+  showStatus("CALIBRATION", "REQUIRED", TFT_RED);
 }
 
 static void serviceCoordinatorProbes() {
@@ -289,7 +303,25 @@ static void serviceReceiverPackets() {
 static void serviceReceiverCapture() {
   atom::radar::CsiFrame frame{};
   while (g_csi_capture.receive(frame)) {
-    // Parsing and signal processing intentionally belong to later pipeline stages.
+    atom::radar::ParsedCsiFrame parsed{};
+    const atom::radar::CsiParseStatus parse_status =
+        g_csi_parser.parse(frame, g_radio.config().bandwidth, parsed);
+    if (parse_status != atom::radar::CsiParseStatus::Ok) {
+      ++g_csi_processing_counters.parse_rejects;
+      continue;
+    }
+    ++g_csi_processing_counters.parsed_frames;
+
+    atom::radar::PreprocessedCsiFrame preprocessed{};
+    const atom::radar::CsiPreprocessStatus preprocess_status =
+        g_csi_preprocessor.process(parsed, nullptr, preprocessed);
+    if (preprocess_status == atom::radar::CsiPreprocessStatus::BaselineRequired) {
+      ++g_csi_processing_counters.baseline_required_frames;
+    } else if (preprocess_status == atom::radar::CsiPreprocessStatus::Ok) {
+      ++g_csi_processing_counters.preprocessed_frames;
+    } else {
+      ++g_csi_processing_counters.preprocess_rejects;
+    }
   }
 
   static int64_t last_report_us = 0;
@@ -303,13 +335,19 @@ static void serviceReceiverCapture() {
   Serial.printf(
       "{\"type\":\"csi_capture\",\"accepted\":%lu,\"filtered\":%lu,"
       "\"invalid_length\":%lu,\"invalid_radio\":%lu,\"queue_drops\":%lu,"
-      "\"queued\":%lu,\"paired\":%s}\r\n",
+      "\"queued\":%lu,\"parsed\":%lu,\"parse_rejects\":%lu,"
+      "\"baseline_required\":%lu,\"preprocess_rejects\":%lu,\"paired\":%s}\r\n",
       static_cast<unsigned long>(counters.accepted_frames),
       static_cast<unsigned long>(counters.filtered_frames),
       static_cast<unsigned long>(counters.invalid_length_frames),
       static_cast<unsigned long>(counters.invalid_radio_frames),
       static_cast<unsigned long>(counters.queue_drops),
-      static_cast<unsigned long>(counters.queued_frames), g_pairing_ready ? "true" : "false");
+      static_cast<unsigned long>(counters.queued_frames),
+      static_cast<unsigned long>(g_csi_processing_counters.parsed_frames),
+      static_cast<unsigned long>(g_csi_processing_counters.parse_rejects),
+      static_cast<unsigned long>(g_csi_processing_counters.baseline_required_frames),
+      static_cast<unsigned long>(g_csi_processing_counters.preprocess_rejects),
+      g_pairing_ready ? "true" : "false");
 }
 
 void setup() {
