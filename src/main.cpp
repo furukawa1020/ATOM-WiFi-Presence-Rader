@@ -2,10 +2,20 @@
 #include <CsiCapture.hpp>
 #include <CsiFrameParser.hpp>
 #include <CsiPreprocessor.hpp>
+#include <CalibrationManager.hpp>
+#include <CalibrationTrainer.hpp>
+#include <CalibratedModelRuntime.hpp>
+#include <CalibrationStorage.hpp>
+#include <CalibrationBootstrap.hpp>
+#include <AdaptiveTemporalEncoder.hpp>
 #include <EspNowTransport.hpp>
+#include <FeatureExtractor.hpp>
+#include <LocalDetector.hpp>
+#include <LocalStateMachine.hpp>
 #include <M5Unified.h>
 #include <Preferences.h>
 #include <RadioController.hpp>
+#include <SubcarrierSelector.hpp>
 #include <WiFi.h>
 #include <protocol.hpp>
 
@@ -55,7 +65,11 @@ static atom::radar::CsiCapture g_csi_capture;
 static atom::radar::CsiFrameParser g_csi_parser;
 static atom::radar::CsiPreprocessor g_csi_preprocessor;
 static atom::radar::EspNowTransport g_esp_now;
+static atom::radar::FeatureExtractor g_feature_extractor;
+static atom::radar::LocalDetector g_local_detector;
+static atom::radar::LocalStateMachine g_local_state_machine;
 static atom::radar::RadioController g_radio;
+static atom::radar::SubcarrierSelection g_subcarrier_selection{};
 static bool g_pairing_ready = false;
 static uint32_t g_system_id = 0;
 
@@ -82,6 +96,9 @@ struct CsiProcessingCounters {
   uint32_t preprocessed_frames;
   uint32_t baseline_required_frames;
   uint32_t preprocess_rejects;
+  uint32_t feature_updates;
+  uint32_t selection_required_frames;
+  uint32_t local_detection_updates;
 };
 
 static CsiProcessingCounters g_csi_processing_counters{};
@@ -319,6 +336,26 @@ static void serviceReceiverCapture() {
       ++g_csi_processing_counters.baseline_required_frames;
     } else if (preprocess_status == atom::radar::CsiPreprocessStatus::Ok) {
       ++g_csi_processing_counters.preprocessed_frames;
+      if (g_subcarrier_selection.count < atom::radar::kMinimumSelectedSubcarriers) {
+        ++g_csi_processing_counters.selection_required_frames;
+      } else {
+        atom::radar::DetectionFeatures features{};
+        if (g_feature_extractor.update(preprocessed, g_subcarrier_selection, features) ==
+            atom::radar::FeatureUpdateStatus::Updated) {
+          ++g_csi_processing_counters.feature_updates;
+          const atom::radar::LocalDetectionResult detection =
+              g_local_detector.evaluate(features, true, nullptr, nullptr);
+          const atom::radar::LocalStateInput state_input{
+              detection,
+              features.quality_valid_ratio,
+              true,
+              false,
+              false,
+          };
+          g_local_state_machine.update(state_input, features.timestamp_us);
+          ++g_csi_processing_counters.local_detection_updates;
+        }
+      }
     } else {
       ++g_csi_processing_counters.preprocess_rejects;
     }
@@ -336,7 +373,9 @@ static void serviceReceiverCapture() {
       "{\"type\":\"csi_capture\",\"accepted\":%lu,\"filtered\":%lu,"
       "\"invalid_length\":%lu,\"invalid_radio\":%lu,\"queue_drops\":%lu,"
       "\"queued\":%lu,\"parsed\":%lu,\"parse_rejects\":%lu,"
-      "\"baseline_required\":%lu,\"preprocess_rejects\":%lu,\"paired\":%s}\r\n",
+      "\"baseline_required\":%lu,\"preprocess_rejects\":%lu,"
+      "\"feature_updates\":%lu,\"selection_required\":%lu,"
+      "\"local_detection_updates\":%lu,\"local_state\":\"%s\",\"paired\":%s}\r\n",
       static_cast<unsigned long>(counters.accepted_frames),
       static_cast<unsigned long>(counters.filtered_frames),
       static_cast<unsigned long>(counters.invalid_length_frames),
@@ -347,6 +386,10 @@ static void serviceReceiverCapture() {
       static_cast<unsigned long>(g_csi_processing_counters.parse_rejects),
       static_cast<unsigned long>(g_csi_processing_counters.baseline_required_frames),
       static_cast<unsigned long>(g_csi_processing_counters.preprocess_rejects),
+      static_cast<unsigned long>(g_csi_processing_counters.feature_updates),
+      static_cast<unsigned long>(g_csi_processing_counters.selection_required_frames),
+      static_cast<unsigned long>(g_csi_processing_counters.local_detection_updates),
+      atom::radar::localStateName(g_local_state_machine.snapshot().state),
       g_pairing_ready ? "true" : "false");
 }
 

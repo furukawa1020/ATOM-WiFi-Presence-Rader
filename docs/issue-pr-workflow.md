@@ -11,8 +11,8 @@ This repository follows issue-first development.
 | ISS-003 | CSI sampling layer | Integrate ESP-IDF CSI callbacks and frame capture | In progress ([Issue #1](https://github.com/furukawa1020/ATOM-WiFi-Presence-Rader/issues/1)) |
 | ISS-004 | ESP-NOW transport layer | Implement TX/RX peer registration and packet framing | In progress ([Issue #3](https://github.com/furukawa1020/ATOM-WiFi-Presence-Rader/issues/3)) |
 | ISS-005 | CSI parsing and preprocessing | Parse HT-LTF I/Q and apply robust normalization | In progress ([Issue #5](https://github.com/furukawa1020/ATOM-WiFi-Presence-Rader/issues/5)) |
-| ISS-006 | Subcarrier selection and features | Select per-link carriers and extract time-window features | Planned |
-| ISS-007 | Occupancy state pipeline | Implement EMPTY/MOVEMENT/PRESENT_STILL/UNCERTAIN/DEGRADED transitions | Planned |
+| ISS-006 | Subcarrier selection and features | Select per-link carriers and extract time-window features | In progress ([Issue #7](https://github.com/furukawa1020/ATOM-WiFi-Presence-Rader/issues/7)) |
+| ISS-007 | Occupancy state pipeline | Implement EMPTY/MOVEMENT/PRESENT_STILL/UNCERTAIN/DEGRADED transitions | In progress ([Issue #9](https://github.com/furukawa1020/ATOM-WiFi-Presence-Rader/issues/9)) |
 | ISS-008 | Calibration flow | Add session-separated training and validation | Planned |
 | ISS-009 | Health + diagnostics | Add health state reporting and fault handling | Planned |
 | ISS-010 | Multi-link fusion | Fuse Receiver summaries with quality weighting | Planned |

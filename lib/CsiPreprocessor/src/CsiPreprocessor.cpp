@@ -12,6 +12,9 @@ CsiPreprocessStatus CsiPreprocessor::process(const ParsedCsiFrame &input,
                                              PreprocessedCsiFrame &output) const {
   output = {};
   output.received_at_us = input.received_at_us;
+  output.rssi = input.rssi;
+  output.noise_floor = input.noise_floor;
+  output.channel = input.channel;
   output.bandwidth_mhz = input.bandwidth_mhz;
   output.sample_count = input.sample_count;
 

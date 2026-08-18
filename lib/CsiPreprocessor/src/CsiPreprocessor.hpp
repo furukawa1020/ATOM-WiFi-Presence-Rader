@@ -39,6 +39,9 @@ struct PreprocessedCsiSample {
 
 struct PreprocessedCsiFrame {
   int64_t received_at_us;
+  int8_t rssi;
+  int8_t noise_floor;
+  uint8_t channel;
   uint8_t bandwidth_mhz;
   uint16_t sample_count;
   uint16_t valid_sample_count;
