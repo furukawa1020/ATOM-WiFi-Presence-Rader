@@ -70,6 +70,9 @@ CsiLinkObservation observationFromPacket(const CsiObservationPacket &packet) {
   observation.dynamic_tap_concentration =
       packetMetric(packet, CsiObservationMetric::DynamicTapConcentration);
   observation.doppler_energy = packetMetric(packet, CsiObservationMetric::DopplerEnergy);
+  observation.doppler_centroid = packetMetric(packet, CsiObservationMetric::DopplerCentroid);
+  observation.doppler_bandwidth = packetMetric(packet, CsiObservationMetric::DopplerBandwidth);
+  observation.doppler_asymmetry = packetMetric(packet, CsiObservationMetric::DopplerAsymmetry);
   observation.respiration_power = packetMetric(packet, CsiObservationMetric::RespirationPower);
   observation.respiration_coherence =
       packetMetric(packet, CsiObservationMetric::RespirationCoherence);
@@ -131,6 +134,12 @@ CsiObservationPacket makeCsiObservationPacket(uint32_t system_id,
       unitToWire(observation.dynamic_tap_concentration);
   packet.metrics[metricIndex(CsiObservationMetric::DopplerEnergy)] =
       unitToWire(observation.doppler_energy);
+  packet.metrics[metricIndex(CsiObservationMetric::DopplerCentroid)] =
+      unitToWire(observation.doppler_centroid);
+  packet.metrics[metricIndex(CsiObservationMetric::DopplerBandwidth)] =
+      unitToWire(observation.doppler_bandwidth);
+  packet.metrics[metricIndex(CsiObservationMetric::DopplerAsymmetry)] =
+      unitToWire(observation.doppler_asymmetry);
   packet.metrics[metricIndex(CsiObservationMetric::RespirationPower)] =
       unitToWire(observation.respiration_power);
   packet.metrics[metricIndex(CsiObservationMetric::RespirationCoherence)] =
@@ -181,6 +190,8 @@ void M5AtomCsiLinkProcessor::resetSignalState(const ParsedCsiFrame &frame) {
   std::memset(carriers_, 0, sizeof(carriers_));
   std::memset(delay_taps_, 0, sizeof(delay_taps_));
   std::memset(fast_history_, 0, sizeof(fast_history_));
+  std::memset(fast_complex_real_history_, 0, sizeof(fast_complex_real_history_));
+  std::memset(fast_complex_imaginary_history_, 0, sizeof(fast_complex_imaginary_history_));
   std::memset(slow_amplitude_history_, 0, sizeof(slow_amplitude_history_));
   std::memset(slow_phase_history_, 0, sizeof(slow_phase_history_));
   carrier_count_ = frame.sample_count;
@@ -726,7 +737,11 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
     tap.previous_valid = true;
   }
 
-  pushFast(combined_projection);
+  const float phase_increment_real =
+      temporal_weight_sum > 1.0e-6F ? phase_vector_real / temporal_weight_sum : 1.0F;
+  const float phase_increment_imaginary =
+      temporal_weight_sum > 1.0e-6F ? phase_vector_imaginary / temporal_weight_sum : 0.0F;
+  pushFast(combined_projection, phase_increment_real, phase_increment_imaginary);
   const float impulse =
       has_previous_projection_
           ? clamp(std::fabs(combined_projection - previous_projection_) / 3.5F, 0.0F, 1.0F)
@@ -794,17 +809,50 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
 
   constexpr float kDopplerFrequencies[] = {1.5F, 3.0F, 5.0F, 8.0F,
                                            12.0F, 18.0F, 26.0F, 34.0F};
-  float doppler_power = 0.0F;
+  float scalar_doppler_power = 0.0F;
+  float complex_doppler_power = 0.0F;
+  float positive_doppler_power = 0.0F;
+  float negative_doppler_power = 0.0F;
+  float weighted_frequency = 0.0F;
+  float weighted_frequency_squared = 0.0F;
   float strongest_doppler_bin = 0.0F;
   for (float frequency : kDopplerFrequencies) {
-    const float power = spectralPower(fast_history_, kFastHistoryCapacity, fast_head_, fast_count_,
-                                      static_cast<float>(config_.target_rate_hz), frequency);
-    doppler_power += power;
-    if (power > strongest_doppler_bin) {
-      strongest_doppler_bin = power;
+    const float scalar_power =
+        spectralPower(fast_history_, kFastHistoryCapacity, fast_head_, fast_count_,
+                      static_cast<float>(config_.target_rate_hz), frequency);
+    const float positive_power = complexSpectralPower(frequency);
+    const float negative_power = complexSpectralPower(-frequency);
+    const float complex_power = positive_power + negative_power;
+    const float combined_power = 0.45F * scalar_power + 0.55F * complex_power;
+    scalar_doppler_power += scalar_power;
+    complex_doppler_power += complex_power;
+    positive_doppler_power += positive_power;
+    negative_doppler_power += negative_power;
+    weighted_frequency += frequency * combined_power;
+    weighted_frequency_squared += frequency * frequency * combined_power;
+    if (combined_power > strongest_doppler_bin) {
+      strongest_doppler_bin = combined_power;
     }
   }
+  const float doppler_power = 0.45F * scalar_doppler_power + 0.55F * complex_doppler_power;
   const float doppler_energy = clamp(std::sqrt(doppler_power / 8.0F) / 1.6F, 0.0F, 1.0F);
+  const float centroid_hz =
+      doppler_power > 1.0e-6F ? weighted_frequency / doppler_power : 0.0F;
+  const float frequency_variance =
+      doppler_power > 1.0e-6F
+          ? weighted_frequency_squared / doppler_power - centroid_hz * centroid_hz
+          : 0.0F;
+  const float doppler_centroid = clamp(centroid_hz / 34.0F, 0.0F, 1.0F);
+  const float doppler_bandwidth =
+      clamp(std::sqrt(frequency_variance > 0.0F ? frequency_variance : 0.0F) / 17.0F,
+            0.0F, 1.0F);
+  const float directional_power = positive_doppler_power + negative_doppler_power;
+  const float doppler_asymmetry =
+      directional_power > 1.0e-6F
+          ? clamp(std::fabs(positive_doppler_power - negative_doppler_power) /
+                      directional_power,
+                  0.0F, 1.0F)
+          : 0.0F;
   const float doppler_concentration =
       doppler_power > 1.0e-6F ? strongest_doppler_bin / doppler_power : 1.0F;
   const float broadband =
@@ -912,9 +960,16 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   observation.dynamic_tap_concentration =
       summary_dynamic_tap_concentration_ / divisor;
   observation.doppler_energy = doppler_energy;
+  observation.doppler_centroid = doppler_centroid;
+  observation.doppler_bandwidth = doppler_bandwidth;
+  observation.doppler_asymmetry = doppler_asymmetry;
   observation.respiration_power = respiration_power;
   observation.respiration_coherence = respiration_coherence;
-  observation.impulse_score = clamp(summary_impulse_ / divisor, 0.0F, 1.0F);
+  const float temporal_impulse = clamp(summary_impulse_ / divisor, 0.0F, 1.0F);
+  observation.impulse_score =
+      clamp(0.70F * temporal_impulse +
+                0.30F * doppler_energy * doppler_bandwidth,
+            0.0F, 1.0F);
   observation.stillness_score = clamp(1.0F - motion_ewma_ * 1.7F, 0.0F, 1.0F);
   observation.baseline_shift = clamp(summary_baseline_shift_ / divisor, 0.0F, 1.0F);
   observation.broadband_nuisance = broadband_ewma_;
@@ -943,12 +998,62 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   return CsiPrecisionUpdateStatus::Updated;
 }
 
-void M5AtomCsiLinkProcessor::pushFast(float value) {
+void M5AtomCsiLinkProcessor::pushFast(float value, float complex_real,
+                                      float complex_imaginary) {
   fast_history_[fast_head_] = value;
+  fast_complex_real_history_[fast_head_] = complex_real;
+  fast_complex_imaginary_history_[fast_head_] = complex_imaginary;
   fast_head_ = (fast_head_ + 1U) % kFastHistoryCapacity;
   if (fast_count_ < kFastHistoryCapacity) {
     ++fast_count_;
   }
+}
+
+float M5AtomCsiLinkProcessor::complexSpectralPower(float frequency_hz) const {
+  if (fast_count_ < 16U || config_.target_rate_hz == 0U || frequency_hz == 0.0F) {
+    return 0.0F;
+  }
+  float mean_real = 0.0F;
+  float mean_imaginary = 0.0F;
+  for (std::size_t index = 0; index < fast_count_; ++index) {
+    mean_real += historyValue(fast_complex_real_history_, kFastHistoryCapacity, fast_head_,
+                              fast_count_, index);
+    mean_imaginary += historyValue(fast_complex_imaginary_history_, kFastHistoryCapacity,
+                                   fast_head_, fast_count_, index);
+  }
+  mean_real /= static_cast<float>(fast_count_);
+  mean_imaginary /= static_cast<float>(fast_count_);
+
+  float spectrum_real = 0.0F;
+  float spectrum_imaginary = 0.0F;
+  float window_sum = 0.0F;
+  for (std::size_t index = 0; index < fast_count_; ++index) {
+    const float sample_real =
+        historyValue(fast_complex_real_history_, kFastHistoryCapacity, fast_head_, fast_count_,
+                     index) -
+        mean_real;
+    const float sample_imaginary =
+        historyValue(fast_complex_imaginary_history_, kFastHistoryCapacity, fast_head_,
+                     fast_count_, index) -
+        mean_imaginary;
+    const float phase =
+        kTwoPi * frequency_hz * static_cast<float>(index) /
+        static_cast<float>(config_.target_rate_hz);
+    const float cosine = std::cos(phase);
+    const float sine = std::sin(phase);
+    const float window =
+        fast_count_ > 1U
+            ? 0.5F - 0.5F *
+                         std::cos(kTwoPi * static_cast<float>(index) /
+                                  static_cast<float>(fast_count_ - 1U))
+            : 1.0F;
+    spectrum_real += window * (sample_real * cosine + sample_imaginary * sine);
+    spectrum_imaginary += window * (sample_imaginary * cosine - sample_real * sine);
+    window_sum += window;
+  }
+  const float normalization = window_sum > 1.0e-6F ? 2.0F / window_sum : 0.0F;
+  return (spectrum_real * spectrum_real + spectrum_imaginary * spectrum_imaginary) *
+         normalization * normalization;
 }
 
 void M5AtomCsiLinkProcessor::pushSlow(float amplitude, float phase) {
@@ -1127,6 +1232,12 @@ bool M5AtomCsiFusion::snapshot(int64_t now_us, FusedCsiObservation &observation)
   observation.dynamic_tap_concentration =
       robustAggregate(&CsiLinkObservation::dynamic_tap_concentration, indices, count);
   observation.doppler_energy = robustAggregate(&CsiLinkObservation::doppler_energy, indices, count);
+  observation.doppler_centroid =
+      robustAggregate(&CsiLinkObservation::doppler_centroid, indices, count);
+  observation.doppler_bandwidth =
+      robustAggregate(&CsiLinkObservation::doppler_bandwidth, indices, count);
+  observation.doppler_asymmetry =
+      robustAggregate(&CsiLinkObservation::doppler_asymmetry, indices, count);
   observation.respiration_power =
       robustAggregate(&CsiLinkObservation::respiration_power, indices, count);
   observation.respiration_coherence =
