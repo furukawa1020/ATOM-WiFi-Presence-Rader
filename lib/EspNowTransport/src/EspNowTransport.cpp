@@ -206,8 +206,9 @@ void EspNowTransport::captureReceived(const esp_now_recv_info_t *info, const uin
 }
 
 bool EspNowTransport::matchesAllowedSource(const uint8_t *source_mac) const {
-  return has_allowed_source_ && source_mac != nullptr &&
-         std::memcmp(source_mac, allowed_source_mac_, ESP_NOW_ETH_ALEN) == 0;
+  return !has_allowed_source_ ||
+         (source_mac != nullptr &&
+          std::memcmp(source_mac, allowed_source_mac_, ESP_NOW_ETH_ALEN) == 0);
 }
 
 }  // namespace atom::radar
