@@ -10,6 +10,7 @@
 #include <CalibrationBootstrap.hpp>
 #include <CalibrationStartupController.hpp>
 #include <AdaptiveTemporalEncoder.hpp>
+#include <BathroomCsiEvidence.hpp>
 #include <EspNowTransport.hpp>
 #include <FeatureExtractor.hpp>
 #include <LocalDetector.hpp>
@@ -73,6 +74,9 @@ static atom::radar::LocalDetector g_local_detector;
 static atom::radar::LocalStateMachine g_local_state_machine;
 static atom::radar::M5AtomCsiLinkProcessor g_m5atom_csi_processor;
 static atom::radar::M5AtomCsiFusion g_m5atom_csi_fusion;
+static atom::radar::BathroomCsiEvidenceAnalyzer g_bathroom_csi_evidence_analyzer;
+static atom::radar::BathroomCsiEvidence g_latest_bathroom_csi_evidence{};
+static bool g_has_bathroom_csi_evidence = false;
 static atom::radar::RadioController g_radio;
 static atom::radar::SubcarrierSelection g_subcarrier_selection{};
 static bool g_pairing_ready = false;
@@ -465,6 +469,19 @@ static void serviceCoordinatorObservations() {
     if (g_m5atom_csi_fusion.ingestPacket(frame.data, frame.length, g_system_id,
                                          frame.received_at_us)) {
       ++g_csi_processing_counters.fused_observations;
+      atom::radar::FusedCsiObservation fused_observation{};
+      if (g_m5atom_csi_fusion.snapshot(frame.received_at_us, fused_observation)) {
+        atom::radar::BathroomCsiEvidence evidence{};
+        const atom::radar::BathroomCsiEvidenceUpdateStatus evidence_status =
+            g_bathroom_csi_evidence_analyzer.update(fused_observation, frame.received_at_us,
+                                                    evidence);
+        if (evidence_status == atom::radar::BathroomCsiEvidenceUpdateStatus::Updated ||
+            evidence_status ==
+                atom::radar::BathroomCsiEvidenceUpdateStatus::ReplacedSameProbe) {
+          g_latest_bathroom_csi_evidence = evidence;
+          g_has_bathroom_csi_evidence = true;
+        }
+      }
     } else {
       ++g_csi_processing_counters.fusion_rejects;
     }
@@ -515,6 +532,21 @@ static void serviceCoordinatorObservations() {
       observation.respiration_coherence, observation.respiration_rate_agreement,
       observation.impulse_score, observation.stillness_score, observation.baseline_shift,
       observation.broadband_nuisance, observation.physically_observable ? "true" : "false");
+  if (g_has_bathroom_csi_evidence) {
+    const atom::radar::BathroomCsiEvidence &evidence = g_latest_bathroom_csi_evidence;
+    Serial.printf(
+        "{\"type\":\"bathroom_csi_evidence\",\"probe\":%lu,\"history\":%u,"
+        "\"fan_like\":%.3f,\"shower_like\":%.3f,\"water_drift_like\":%.3f,"
+        "\"door_transient_like\":%.3f,\"human_motion\":%.3f,"
+        "\"nuisance_reduced_human\":%.3f,\"unexplained_innovation\":%.3f,"
+        "\"nuisance_confidence\":%.3f,\"quality\":%.3f,\"ready\":%s}\r\n",
+        static_cast<unsigned long>(evidence.probe_sequence), evidence.history_points,
+        evidence.fan_like_evidence, evidence.shower_like_evidence,
+        evidence.water_drift_like_evidence, evidence.door_transient_like_evidence,
+        evidence.human_motion_evidence, evidence.nuisance_reduced_human_motion,
+        evidence.unexplained_innovation, evidence.nuisance_confidence,
+        evidence.analysis_quality, evidence.evidence_ready ? "true" : "false");
+  }
 }
 
 void setup() {
