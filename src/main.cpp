@@ -1,8 +1,11 @@
 #include <Arduino.h>
 #include <CsiCapture.hpp>
+#include <EspNowTransport.hpp>
 #include <M5Unified.h>
 #include <Preferences.h>
+#include <RadioController.hpp>
 #include <WiFi.h>
+#include <protocol.hpp>
 
 extern "C" {
 #include "esp_wifi.h"
@@ -22,6 +25,18 @@ extern "C" {
 #define NODE_ID 1
 #endif
 
+#ifndef RADIO_CHANNEL
+#define RADIO_CHANNEL 6
+#endif
+
+#ifndef RADIO_BANDWIDTH_MHZ
+#define RADIO_BANDWIDTH_MHZ 20
+#endif
+
+static_assert(RADIO_CHANNEL >= 1 && RADIO_CHANNEL <= 13, "RADIO_CHANNEL must be 1-13");
+static_assert(RADIO_BANDWIDTH_MHZ == 20 || RADIO_BANDWIDTH_MHZ == 40,
+              "RADIO_BANDWIDTH_MHZ must be 20 or 40");
+
 enum class NodeRole : uint8_t {
   TxCoordinator = 0,
   Receiver = 1
@@ -35,7 +50,27 @@ struct RuntimeConfig {
 
 static constexpr const char *kRoleNames[] = {"TX_COORDINATOR", "RECEIVER"};
 static atom::radar::CsiCapture g_csi_capture;
+static atom::radar::EspNowTransport g_esp_now;
+static atom::radar::RadioController g_radio;
 static bool g_pairing_ready = false;
+static uint32_t g_system_id = 0;
+
+struct PairingConfig {
+  uint32_t system_id;
+  uint8_t coordinator_mac[atom::radar::kWifiMacLength];
+  bool has_coordinator_mac;
+};
+
+struct ProbeReceiveCounters {
+  uint32_t accepted;
+  uint32_t invalid;
+  uint32_t duplicates;
+  uint32_t sequence_regressions;
+};
+
+static ProbeReceiveCounters g_probe_receive_counters{};
+static bool g_has_probe_sequence = false;
+static uint32_t g_last_probe_sequence = 0;
 
 static RuntimeConfig buildRuntimeConfig() {
   RuntimeConfig cfg{};
@@ -61,56 +96,86 @@ static void showStatus(const char *line_one, const char *line_two, uint32_t colo
   M5.Display.println(line_two);
 }
 
-static esp_err_t initNetwork() {
-  if (!WiFi.mode(WIFI_STA)) {
-    return ESP_FAIL;
-  }
-  WiFi.disconnect(false, false);
-  delay(20);
-  return esp_wifi_set_ps(WIFI_PS_NONE);
+static atom::radar::RadioConfig buildRadioConfig() {
+  atom::radar::RadioConfig config{};
+  config.channel = RADIO_CHANNEL;
+#if RADIO_BANDWIDTH_MHZ == 40
+  config.bandwidth = WIFI_BW_HT40;
+  config.secondary_channel = RADIO_CHANNEL <= 7 ? WIFI_SECOND_CHAN_ABOVE : WIFI_SECOND_CHAN_BELOW;
+#else
+  config.bandwidth = WIFI_BW_HT20;
+  config.secondary_channel = WIFI_SECOND_CHAN_NONE;
+#endif
+  return config;
 }
 
-static bool loadCoordinatorMac(uint8_t *coordinator_mac) {
+static PairingConfig loadPairingConfig() {
+  PairingConfig config{};
   Preferences prefs;
   if (!prefs.begin("pairing", true)) {
-    return false;
+    return config;
   }
 
-  const bool valid_length = prefs.getBytesLength("coord_mac") == atom::radar::kWifiMacLength;
-  const bool loaded = valid_length &&
-                      prefs.getBytes("coord_mac", coordinator_mac, atom::radar::kWifiMacLength) ==
-                          atom::radar::kWifiMacLength;
+  config.system_id = prefs.getUInt("system_id", 0);
+  config.has_coordinator_mac =
+      prefs.getBytesLength("coord_mac") == atom::radar::kWifiMacLength &&
+      prefs.getBytes("coord_mac", config.coordinator_mac, atom::radar::kWifiMacLength) ==
+          atom::radar::kWifiMacLength;
   prefs.end();
-  return loaded;
+  return config;
 }
 
 static void setupTxRole(const RuntimeConfig &cfg) {
   (void)cfg;
   Serial.println("Initializing transmitter role...");
-  const esp_err_t result = initNetwork();
+  const PairingConfig pairing = loadPairingConfig();
+  g_system_id = pairing.system_id;
+
+  const atom::radar::RadioConfig radio_config = buildRadioConfig();
+  esp_err_t result = g_radio.begin(radio_config);
   if (result != ESP_OK) {
-    Serial.printf("Wi-Fi initialization failed: %s\r\n", esp_err_to_name(result));
-    showStatus("WIFI", "INITIALIZATION FAILED", TFT_RED);
+    Serial.printf("Radio initialization failed: %s\r\n", esp_err_to_name(result));
+    showStatus("RADIO", "INITIALIZATION FAILED", TFT_RED);
     return;
   }
-  showStatus("TX / COORDINATOR", "READY", TFT_WHITE);
-  Serial.println("TX role runtime skeleton ready.");
+
+  result = g_esp_now.begin(radio_config.channel, radio_config.bandwidth, nullptr, true);
+  if (result != ESP_OK) {
+    Serial.printf("ESP-NOW initialization failed: %s\r\n", esp_err_to_name(result));
+    showStatus("ESP-NOW", "INITIALIZATION FAILED", TFT_RED);
+    return;
+  }
+  showStatus("TX / COORDINATOR", "PROBES READY", TFT_WHITE);
+  Serial.printf("TX probe transport ready: channel=%u bandwidth=%uMHz system=%lu\r\n",
+                radio_config.channel, RADIO_BANDWIDTH_MHZ,
+                static_cast<unsigned long>(g_system_id));
 }
 
 static void setupReceiverRole(const RuntimeConfig &cfg) {
   (void)cfg;
   Serial.println("Initializing receiver role...");
-  const esp_err_t network_result = initNetwork();
-  if (network_result != ESP_OK) {
-    Serial.printf("Wi-Fi initialization failed: %s\r\n", esp_err_to_name(network_result));
-    showStatus("WIFI", "INITIALIZATION FAILED", TFT_RED);
+  const PairingConfig pairing = loadPairingConfig();
+  g_system_id = pairing.system_id;
+  g_pairing_ready = pairing.has_coordinator_mac;
+
+  const atom::radar::RadioConfig radio_config = buildRadioConfig();
+  esp_err_t result = g_radio.begin(radio_config);
+  if (result != ESP_OK) {
+    Serial.printf("Radio initialization failed: %s\r\n", esp_err_to_name(result));
+    showStatus("RADIO", "INITIALIZATION FAILED", TFT_RED);
     return;
   }
 
-  uint8_t coordinator_mac[atom::radar::kWifiMacLength]{};
-  g_pairing_ready = loadCoordinatorMac(coordinator_mac);
+  result = g_esp_now.begin(radio_config.channel, radio_config.bandwidth,
+                           g_pairing_ready ? pairing.coordinator_mac : nullptr, false);
+  if (result != ESP_OK) {
+    Serial.printf("ESP-NOW initialization failed: %s\r\n", esp_err_to_name(result));
+    showStatus("ESP-NOW", "INITIALIZATION FAILED", TFT_RED);
+    return;
+  }
 
-  const esp_err_t csi_result = g_csi_capture.begin(g_pairing_ready ? coordinator_mac : nullptr);
+  const esp_err_t csi_result =
+      g_csi_capture.begin(g_pairing_ready ? pairing.coordinator_mac : nullptr);
   if (csi_result != ESP_OK) {
     Serial.printf("CSI initialization failed: %s\r\n", esp_err_to_name(csi_result));
     showStatus("CSI", "UNSUPPORTED", TFT_RED);
@@ -124,9 +189,101 @@ static void setupReceiverRole(const RuntimeConfig &cfg) {
   }
 
   Serial.printf("CSI capture ready for Coordinator %02X:%02X:%02X:%02X:%02X:%02X\r\n",
-                coordinator_mac[0], coordinator_mac[1], coordinator_mac[2], coordinator_mac[3],
-                coordinator_mac[4], coordinator_mac[5]);
+                pairing.coordinator_mac[0], pairing.coordinator_mac[1], pairing.coordinator_mac[2],
+                pairing.coordinator_mac[3], pairing.coordinator_mac[4], pairing.coordinator_mac[5]);
   showStatus("CSI CAPTURE", "READY", TFT_WHITE);
+}
+
+static void serviceCoordinatorProbes() {
+  constexpr int64_t kProbeIntervalUs = 1000000LL / CSI_TARGET_SAMPLE_RATE_HZ;
+  static int64_t next_probe_us = 0;
+  static uint32_t sequence = 0;
+
+  const int64_t now_us = esp_timer_get_time();
+  if (next_probe_us == 0) {
+    next_probe_us = now_us;
+  }
+  if (now_us < next_probe_us) {
+    return;
+  }
+
+  const atom::radar::protocol::WireBandwidth bandwidth =
+      RADIO_BANDWIDTH_MHZ == 40 ? atom::radar::protocol::WireBandwidth::Ht40
+                                : atom::radar::protocol::WireBandwidth::Ht20;
+  const atom::radar::protocol::ProbePacket packet = atom::radar::protocol::makeProbePacket(
+      g_system_id, sequence, static_cast<uint64_t>(now_us), RADIO_CHANNEL, bandwidth);
+
+  const esp_err_t result = g_esp_now.send(atom::radar::EspNowTransport::broadcastAddress(), &packet,
+                                          sizeof(packet), now_us);
+  if (result == ESP_OK) {
+    ++sequence;
+    next_probe_us += kProbeIntervalUs;
+    if (now_us - next_probe_us > kProbeIntervalUs * 4) {
+      next_probe_us = now_us + kProbeIntervalUs;
+    }
+  } else if (result != ESP_ERR_INVALID_STATE) {
+    next_probe_us = now_us + kProbeIntervalUs;
+  }
+
+  static int64_t last_report_us = 0;
+  if (now_us - last_report_us >= 1000000) {
+    last_report_us = now_us;
+    const atom::radar::EspNowCounters counters = g_esp_now.counters();
+    Serial.printf(
+        "{\"type\":\"probe_tx\",\"requested\":%lu,\"success\":%lu,\"failed\":%lu,"
+        "\"timeouts\":%lu,\"immediate_errors\":%lu,\"pending\":%s}\r\n",
+        static_cast<unsigned long>(counters.send_requests),
+        static_cast<unsigned long>(counters.send_successes),
+        static_cast<unsigned long>(counters.send_failures),
+        static_cast<unsigned long>(counters.send_timeouts),
+        static_cast<unsigned long>(counters.immediate_send_errors),
+        g_esp_now.sendPending() ? "true" : "false");
+  }
+}
+
+static void serviceReceiverPackets() {
+  atom::radar::EspNowFrame frame{};
+  while (g_esp_now.receive(frame)) {
+    atom::radar::protocol::ProbePacket probe{};
+    if (!atom::radar::protocol::decodeProbePacket(frame.data, frame.length, probe) ||
+        (g_system_id != 0U && probe.system_id != g_system_id) || probe.channel != RADIO_CHANNEL ||
+        probe.bandwidth != RADIO_BANDWIDTH_MHZ) {
+      ++g_probe_receive_counters.invalid;
+      continue;
+    }
+
+    if (g_has_probe_sequence) {
+      if (probe.sequence == g_last_probe_sequence) {
+        ++g_probe_receive_counters.duplicates;
+        continue;
+      }
+      if (!atom::radar::protocol::isSequenceNewer(probe.sequence, g_last_probe_sequence)) {
+        ++g_probe_receive_counters.sequence_regressions;
+        continue;
+      }
+    }
+
+    g_has_probe_sequence = true;
+    g_last_probe_sequence = probe.sequence;
+    ++g_probe_receive_counters.accepted;
+  }
+
+  static int64_t last_report_us = 0;
+  const int64_t now_us = esp_timer_get_time();
+  if (now_us - last_report_us >= 1000000) {
+    last_report_us = now_us;
+    const atom::radar::EspNowCounters counters = g_esp_now.counters();
+    Serial.printf(
+        "{\"type\":\"probe_rx\",\"accepted\":%lu,\"invalid\":%lu,"
+        "\"duplicates\":%lu,\"sequence_regressions\":%lu,\"filtered\":%lu,"
+        "\"queue_drops\":%lu}\r\n",
+        static_cast<unsigned long>(g_probe_receive_counters.accepted),
+        static_cast<unsigned long>(g_probe_receive_counters.invalid),
+        static_cast<unsigned long>(g_probe_receive_counters.duplicates),
+        static_cast<unsigned long>(g_probe_receive_counters.sequence_regressions),
+        static_cast<unsigned long>(counters.filtered_frames),
+        static_cast<unsigned long>(counters.receive_queue_drops));
+  }
 }
 
 static void serviceReceiverCapture() {
@@ -173,8 +330,17 @@ void setup() {
 
 void loop() {
   M5.update();
-  if (NODE_ROLE == static_cast<uint8_t>(NodeRole::Receiver) && g_csi_capture.started()) {
-    serviceReceiverCapture();
+  if (NODE_ROLE == static_cast<uint8_t>(NodeRole::TxCoordinator)) {
+    if (g_esp_now.started()) {
+      serviceCoordinatorProbes();
+    }
+  } else {
+    if (g_esp_now.started()) {
+      serviceReceiverPackets();
+    }
+    if (g_csi_capture.started()) {
+      serviceReceiverCapture();
+    }
   }
   delay(2);
 }

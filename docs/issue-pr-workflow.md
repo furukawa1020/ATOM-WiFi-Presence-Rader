@@ -9,7 +9,7 @@ This repository follows issue-first development.
 | ISS-001 | Bootstrap PlatformIO project | Add PlatformIO config, board definition, and build-time target skeletons | ✅ Done |
 | ISS-002 | Base firmware skeleton | Add unified `main.cpp` with role-based startup and runtime scaffolding | ✅ Done |
 | ISS-003 | CSI sampling layer | Integrate ESP-IDF CSI callbacks and frame capture | In progress ([Issue #1](https://github.com/furukawa1020/ATOM-WiFi-Presence-Rader/issues/1)) |
-| ISS-004 | ESP-NOW transport layer | Implement TX/RX peer registration and packet framing | ⏳ Planned |
+| ISS-004 | ESP-NOW transport layer | Implement TX/RX peer registration and packet framing | In progress ([Issue #3](https://github.com/furukawa1020/ATOM-WiFi-Presence-Rader/issues/3)) |
 | ISS-005 | Occupancy state pipeline | Implement EMPTY/MOVEMENT/PRESENT_STILL/UNCERTAIN/DEGRADED transitions | ⏳ Planned |
 | ISS-006 | Calibration flow | Add empty and presence calibration persistence with NVS/Preferences | ⏳ Planned |
 | ISS-007 | Health + diagnostics | Add health state reporting and fault handling | ⏳ Planned |
