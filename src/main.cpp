@@ -492,7 +492,9 @@ static void serviceCoordinatorObservations() {
       "\"amplitude\":%.3f,\"phase\":%.3f,"
       "\"complex_ratio\":%.3f,\"subcarrier_reliability\":%.3f,"
       "\"delay_motion\":%.3f,\"delay_spread\":%.3f,"
-      "\"dynamic_tap_concentration\":%.3f,\"doppler\":%.3f,\"respiration\":%.3f,"
+      "\"dynamic_tap_concentration\":%.3f,\"doppler\":%.3f,"
+      "\"doppler_centroid\":%.3f,\"doppler_bandwidth\":%.3f,"
+      "\"doppler_asymmetry\":%.3f,\"respiration\":%.3f,"
       "\"respiration_coherence\":%.3f,\"impulse\":%.3f,\"stillness\":%.3f,"
       "\"baseline_shift\":%.3f,\"broadband_nuisance\":%.3f,"
       "\"physically_observable\":%s}\r\n",
@@ -502,6 +504,8 @@ static void serviceCoordinatorObservations() {
       observation.complex_ratio_motion, observation.subcarrier_reliability,
       observation.delay_domain_motion, observation.delay_spread,
       observation.dynamic_tap_concentration, observation.doppler_energy,
+      observation.doppler_centroid, observation.doppler_bandwidth,
+      observation.doppler_asymmetry,
       observation.respiration_power, observation.respiration_coherence,
       observation.impulse_score, observation.stillness_score, observation.baseline_shift,
       observation.broadband_nuisance, observation.physically_observable ? "true" : "false");

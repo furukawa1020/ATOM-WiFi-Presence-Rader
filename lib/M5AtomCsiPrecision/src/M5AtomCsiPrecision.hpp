@@ -72,10 +72,11 @@ class M5AtomCsiLinkProcessor final {
 
   ProbeMatchStatus matchProbe(int64_t received_at_us, MatchedProbe &matched);
   void resetSignalState(const ParsedCsiFrame &frame);
-  void pushFast(float value);
+  void pushFast(float value, float complex_real, float complex_imaginary);
   void pushSlow(float amplitude, float phase);
   float spectralPower(const float *history, std::size_t capacity, std::size_t head,
                       std::size_t count, float sample_rate_hz, float frequency_hz) const;
+  float complexSpectralPower(float frequency_hz) const;
   float historyValue(const float *history, std::size_t capacity, std::size_t head,
                      std::size_t count, std::size_t chronological_index) const;
   static float clamp(float value, float lower, float upper);
@@ -99,6 +100,8 @@ class M5AtomCsiLinkProcessor final {
   bool layout_ready_{false};
 
   float fast_history_[kFastHistoryCapacity]{};
+  float fast_complex_real_history_[kFastHistoryCapacity]{};
+  float fast_complex_imaginary_history_[kFastHistoryCapacity]{};
   std::size_t fast_head_{0};
   std::size_t fast_count_{0};
   float slow_amplitude_history_[kSlowHistoryCapacity]{};
