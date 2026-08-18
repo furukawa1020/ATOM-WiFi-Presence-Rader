@@ -1,6 +1,7 @@
 #include "CalibrationStorage.hpp"
 
 #include <Preferences.h>
+#include <AdaptiveTemporalEncoder.hpp>
 #include <math.h>
 
 namespace {
@@ -235,6 +236,8 @@ bool CalibrationStorage::validateArtifact(
       artifact.selected_subcarrier_count == 0 ||
       artifact.selected_subcarrier_count >
           kCalibrationMaxSelectedSubcarriers ||
+      !AdaptiveTemporalEncoder::validateModel(
+          artifact.temporal_encoder) ||
       !validModel(artifact.model)) {
     return false;
   }

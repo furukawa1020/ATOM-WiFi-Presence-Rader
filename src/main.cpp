@@ -6,6 +6,7 @@
 #include <CalibrationTrainer.hpp>
 #include <CalibratedModelRuntime.hpp>
 #include <CalibrationStorage.hpp>
+#include <AdaptiveTemporalEncoder.hpp>
 #include <EspNowTransport.hpp>
 #include <FeatureExtractor.hpp>
 #include <LocalDetector.hpp>

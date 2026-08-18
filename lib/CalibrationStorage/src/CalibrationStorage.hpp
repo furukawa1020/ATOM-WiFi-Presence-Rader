@@ -63,8 +63,8 @@ struct CalibrationStorageBlob {
 class CalibrationStorage {
  public:
   static constexpr uint32_t kMagic = 0x41544F4DU;
-  static constexpr uint16_t kStorageVersion = 1;
-  static constexpr uint16_t kArtifactVersion = 1;
+  static constexpr uint16_t kStorageVersion = 2;
+  static constexpr uint16_t kArtifactVersion = 2;
 
   CalibrationStorageStatus save(
       const CalibrationArtifact& artifact,
