@@ -1,7 +1,8 @@
 #include <Arduino.h>
+#include <CsiCapture.hpp>
 #include <M5Unified.h>
-#include <WiFi.h>
 #include <Preferences.h>
+#include <WiFi.h>
 
 extern "C" {
 #include "esp_wifi.h"
@@ -26,14 +27,6 @@ enum class NodeRole : uint8_t {
   Receiver = 1
 };
 
-enum class OccupancyState : uint8_t {
-  Empty = 0,
-  Movement,
-  PresentStill,
-  Uncertain,
-  Degraded
-};
-
 struct RuntimeConfig {
   NodeRole role;
   uint8_t node_id;
@@ -41,7 +34,8 @@ struct RuntimeConfig {
 };
 
 static constexpr const char *kRoleNames[] = {"TX_COORDINATOR", "RECEIVER"};
-static constexpr const char *kStateNames[] = {"EMPTY", "MOVEMENT", "PRESENT_STILL", "UNCERTAIN", "DEGRADED"};
+static atom::radar::CsiCapture g_csi_capture;
+static bool g_pairing_ready = false;
 
 static RuntimeConfig buildRuntimeConfig() {
   RuntimeConfig cfg{};
@@ -57,53 +51,108 @@ static void printBootInfo(const RuntimeConfig &cfg) {
                 cfg.node_id, cfg.app_version);
 }
 
-#ifndef CONFIG_ESP_WIFI_CSI_ENABLED
-#warning "Wi-Fi CSI may be disabled in this ESP32-COMPONENT build."
-#endif
-
-static void initNetwork() {
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true, true);
-  delay(20);
+static void showStatus(const char *line_one, const char *line_two, uint32_t color) {
+  M5.Display.clear(TFT_BLACK);
+  M5.Display.setTextColor(color, TFT_BLACK);
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 48);
+  M5.Display.println(line_one);
+  M5.Display.setCursor(8, 66);
+  M5.Display.println(line_two);
 }
 
-static void initEmptyTelemetry() {
-  Preferences prefs;
-  bool ok = prefs.begin("radar", true);
-  if (!ok) {
-    Serial.println("Preferences open for read failed.");
-  } else {
-    Serial.println("Preferences opened for read.");
+static esp_err_t initNetwork() {
+  if (!WiFi.mode(WIFI_STA)) {
+    return ESP_FAIL;
   }
+  WiFi.disconnect(false, false);
+  delay(20);
+  return esp_wifi_set_ps(WIFI_PS_NONE);
+}
+
+static bool loadCoordinatorMac(uint8_t *coordinator_mac) {
+  Preferences prefs;
+  if (!prefs.begin("pairing", true)) {
+    return false;
+  }
+
+  const bool valid_length = prefs.getBytesLength("coord_mac") == atom::radar::kWifiMacLength;
+  const bool loaded = valid_length &&
+                      prefs.getBytes("coord_mac", coordinator_mac, atom::radar::kWifiMacLength) ==
+                          atom::radar::kWifiMacLength;
   prefs.end();
+  return loaded;
 }
 
 static void setupTxRole(const RuntimeConfig &cfg) {
   (void)cfg;
   Serial.println("Initializing transmitter role...");
-  initNetwork();
+  const esp_err_t result = initNetwork();
+  if (result != ESP_OK) {
+    Serial.printf("Wi-Fi initialization failed: %s\r\n", esp_err_to_name(result));
+    showStatus("WIFI", "INITIALIZATION FAILED", TFT_RED);
+    return;
+  }
+  showStatus("TX / COORDINATOR", "READY", TFT_WHITE);
   Serial.println("TX role runtime skeleton ready.");
 }
 
 static void setupReceiverRole(const RuntimeConfig &cfg) {
   (void)cfg;
   Serial.println("Initializing receiver role...");
-  initNetwork();
-  Serial.println("RX role runtime skeleton ready.");
+  const esp_err_t network_result = initNetwork();
+  if (network_result != ESP_OK) {
+    Serial.printf("Wi-Fi initialization failed: %s\r\n", esp_err_to_name(network_result));
+    showStatus("WIFI", "INITIALIZATION FAILED", TFT_RED);
+    return;
+  }
+
+  uint8_t coordinator_mac[atom::radar::kWifiMacLength]{};
+  g_pairing_ready = loadCoordinatorMac(coordinator_mac);
+
+  const esp_err_t csi_result = g_csi_capture.begin(g_pairing_ready ? coordinator_mac : nullptr);
+  if (csi_result != ESP_OK) {
+    Serial.printf("CSI initialization failed: %s\r\n", esp_err_to_name(csi_result));
+    showStatus("CSI", "UNSUPPORTED", TFT_RED);
+    return;
+  }
+
+  if (!g_pairing_ready) {
+    Serial.println("CSI capture ready; Coordinator MAC is not paired.");
+    showStatus("PAIRING", "REQUIRED", TFT_YELLOW);
+    return;
+  }
+
+  Serial.printf("CSI capture ready for Coordinator %02X:%02X:%02X:%02X:%02X:%02X\r\n",
+                coordinator_mac[0], coordinator_mac[1], coordinator_mac[2], coordinator_mac[3],
+                coordinator_mac[4], coordinator_mac[5]);
+  showStatus("CSI CAPTURE", "READY", TFT_WHITE);
 }
 
-static OccupancyState computePlaceholderState(uint32_t tick_count) {
-  const uint32_t cycle = tick_count % 1000;
-  if (cycle < 850) {
-    return OccupancyState::Empty;
+static void serviceReceiverCapture() {
+  atom::radar::CsiFrame frame{};
+  while (g_csi_capture.receive(frame)) {
+    // Parsing and signal processing intentionally belong to later pipeline stages.
   }
-  if (cycle < 900) {
-    return OccupancyState::Movement;
+
+  static int64_t last_report_us = 0;
+  const int64_t now_us = esp_timer_get_time();
+  if (now_us - last_report_us < 1000000) {
+    return;
   }
-  if (cycle < 950) {
-    return OccupancyState::PresentStill;
-  }
-  return OccupancyState::Uncertain;
+  last_report_us = now_us;
+
+  const atom::radar::CsiCaptureCounters counters = g_csi_capture.counters();
+  Serial.printf(
+      "{\"type\":\"csi_capture\",\"accepted\":%lu,\"filtered\":%lu,"
+      "\"invalid_length\":%lu,\"invalid_radio\":%lu,\"queue_drops\":%lu,"
+      "\"queued\":%lu,\"paired\":%s}\r\n",
+      static_cast<unsigned long>(counters.accepted_frames),
+      static_cast<unsigned long>(counters.filtered_frames),
+      static_cast<unsigned long>(counters.invalid_length_frames),
+      static_cast<unsigned long>(counters.invalid_radio_frames),
+      static_cast<unsigned long>(counters.queue_drops),
+      static_cast<unsigned long>(counters.queued_frames), g_pairing_ready ? "true" : "false");
 }
 
 void setup() {
@@ -112,8 +161,8 @@ void setup() {
   auto cfg = buildRuntimeConfig();
 
   M5.begin();
+  showStatus("INITIALIZING", "PLEASE WAIT", TFT_WHITE);
   printBootInfo(cfg);
-  initEmptyTelemetry();
 
   if (cfg.role == NodeRole::TxCoordinator) {
     setupTxRole(cfg);
@@ -123,13 +172,9 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t tick = 0;
-  static uint64_t last_ms = 0;
-  uint64_t now_ms = esp_timer_get_time() / 1000;
-  if (now_ms - last_ms >= 1000) {
-    last_ms = now_ms;
-    OccupancyState state = computePlaceholderState(tick++);
-    Serial.printf("tick=%u state=%s\r\n", tick, kStateNames[static_cast<uint8_t>(state)]);
+  M5.update();
+  if (NODE_ROLE == static_cast<uint8_t>(NodeRole::Receiver) && g_csi_capture.started()) {
+    serviceReceiverCapture();
   }
-  delay(10);
+  delay(2);
 }
