@@ -74,7 +74,7 @@ void CalibratedModelRuntime::reset() {
 
 CalibratedRuntimeStatus CalibratedModelRuntime::activate(
     const CalibratedDetectionModel& candidate) {
-  if (!validModel(candidate)) {
+  if (!validateModel(candidate)) {
     return CalibratedRuntimeStatus::InvalidModel;
   }
 
@@ -161,7 +161,7 @@ bool CalibratedModelRuntime::validSchema(
       schema.feature_count <= kCalibrationMaxFeatures;
 }
 
-bool CalibratedModelRuntime::validModel(
+bool CalibratedModelRuntime::validateModel(
     const CalibratedDetectionModel& model) {
   if (!model.ready || !validSchema(model.feature_schema) ||
       model.feature_count != model.feature_schema.feature_count) {
