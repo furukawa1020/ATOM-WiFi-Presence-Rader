@@ -5,6 +5,7 @@
 #include <CalibrationManager.hpp>
 #include <CalibrationTrainer.hpp>
 #include <CalibratedModelRuntime.hpp>
+#include <CalibrationStorage.hpp>
 #include <EspNowTransport.hpp>
 #include <FeatureExtractor.hpp>
 #include <LocalDetector.hpp>
