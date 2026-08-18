@@ -61,7 +61,10 @@ class CalibratedModelRuntime {
 
  private:
   static bool validSchema(const CalibrationFeatureSchema& schema);
-  static bool validModel(const CalibratedDetectionModel& model);
+ public:
+  static bool validateModel(const CalibratedDetectionModel& model);
+
+ private:
   static float sigmoid(float value);
   static float score(
       const CalibrationFeatureVector& features,
