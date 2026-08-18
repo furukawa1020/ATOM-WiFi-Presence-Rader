@@ -4,6 +4,7 @@
 
 #include "CsiPreprocessor.hpp"
 #include "calibration_model_types.hpp"
+#include "adaptive_temporal_encoder_types.hpp"
 
 constexpr uint8_t kCalibrationMaxReceivers = 3;
 constexpr uint8_t kCalibrationMaxNodes = 4;
@@ -39,7 +40,7 @@ struct CalibrationRadioProfile {
 };
 
 struct CalibrationArtifact {
-  uint16_t artifact_version = 1;
+  uint16_t artifact_version = 2;
   uint32_t calibration_id = 0;
   uint64_t created_at_unix_s = 0;
   uint32_t firmware_compatibility_version = 0;
@@ -56,5 +57,6 @@ struct CalibrationArtifact {
   uint16_t covariance_value_count = 0;
   float covariance_lower_triangle[
       kCalibrationMaxCovarianceValues]{};
+  AdaptiveTemporalEncoderModel temporal_encoder{};
   CalibratedDetectionModel model{};
 };
