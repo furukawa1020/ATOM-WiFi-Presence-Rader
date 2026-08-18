@@ -69,6 +69,9 @@ CsiLinkObservation observationFromPacket(const CsiObservationPacket &packet) {
   observation.delay_spread = packetMetric(packet, CsiObservationMetric::DelaySpread);
   observation.dynamic_tap_concentration =
       packetMetric(packet, CsiObservationMetric::DynamicTapConcentration);
+  observation.background_explained_ratio =
+      packetMetric(packet, CsiObservationMetric::BackgroundExplainedRatio);
+  observation.innovation_motion = packetMetric(packet, CsiObservationMetric::InnovationMotion);
   observation.doppler_energy = packetMetric(packet, CsiObservationMetric::DopplerEnergy);
   observation.doppler_centroid = packetMetric(packet, CsiObservationMetric::DopplerCentroid);
   observation.doppler_bandwidth = packetMetric(packet, CsiObservationMetric::DopplerBandwidth);
@@ -138,6 +141,10 @@ CsiObservationPacket makeCsiObservationPacket(uint32_t system_id,
       unitToWire(observation.delay_spread);
   packet.metrics[metricIndex(CsiObservationMetric::DynamicTapConcentration)] =
       unitToWire(observation.dynamic_tap_concentration);
+  packet.metrics[metricIndex(CsiObservationMetric::BackgroundExplainedRatio)] =
+      unitToWire(observation.background_explained_ratio);
+  packet.metrics[metricIndex(CsiObservationMetric::InnovationMotion)] =
+      unitToWire(observation.innovation_motion);
   packet.metrics[metricIndex(CsiObservationMetric::DopplerEnergy)] =
       unitToWire(observation.doppler_energy);
   packet.metrics[metricIndex(CsiObservationMetric::DopplerCentroid)] =
@@ -201,6 +208,7 @@ void M5AtomCsiLinkProcessor::reset() {
 void M5AtomCsiLinkProcessor::resetSignalState(const ParsedCsiFrame &frame) {
   std::memset(carriers_, 0, sizeof(carriers_));
   std::memset(delay_taps_, 0, sizeof(delay_taps_));
+  std::memset(background_basis_, 0, sizeof(background_basis_));
   std::memset(fast_history_, 0, sizeof(fast_history_));
   std::memset(fast_complex_real_history_, 0, sizeof(fast_complex_real_history_));
   std::memset(fast_complex_imaginary_history_, 0, sizeof(fast_complex_imaginary_history_));
@@ -224,6 +232,8 @@ void M5AtomCsiLinkProcessor::resetSignalState(const ParsedCsiFrame &frame) {
   for (DelayTapState &tap : delay_taps_) {
     tap.noise_variance = config_.delay_noise_floor * config_.delay_noise_floor;
   }
+  initializeBackgroundBasis();
+  background_update_count_ = 0;
   float norm = 0.0F;
   for (std::size_t index = 0; index < carrier_count_; ++index) {
     norm += carriers_[index].principal_weight * carriers_[index].principal_weight;
@@ -256,6 +266,8 @@ void M5AtomCsiLinkProcessor::resetSignalState(const ParsedCsiFrame &frame) {
   summary_delay_motion_ = 0.0F;
   summary_delay_spread_ = 0.0F;
   summary_dynamic_tap_concentration_ = 0.0F;
+  summary_background_explained_ratio_ = 0.0F;
+  summary_innovation_motion_ = 0.0F;
   summary_amplitude_projection_ = 0.0F;
   summary_phase_projection_ = 0.0F;
   previous_projection_ = 0.0F;
@@ -263,6 +275,7 @@ void M5AtomCsiLinkProcessor::resetSignalState(const ParsedCsiFrame &frame) {
   impulse_peak_ = 0.0F;
   baseline_shift_ewma_ = 0.0F;
   broadband_ewma_ = 0.0F;
+  background_motion_ewma_ = 0.0F;
   has_previous_projection_ = false;
 }
 
@@ -557,6 +570,74 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   const float frequency_motion =
       clamp(0.38F * amplitude_motion + 0.34F * phase_motion + 0.28F * ratio_motion, 0.0F, 1.0F);
 
+  float background_input[kMaximumHtSubcarrierCount]{};
+  float background_residual[kMaximumHtSubcarrierCount]{};
+  float background_total_energy = 0.0F;
+  std::size_t background_input_count = 0;
+  for (std::size_t index = 0; index < frame.sample_count; ++index) {
+    if (!valid[index] || !carriers_[index].previous_valid) {
+      continue;
+    }
+    background_input[index] =
+        clamp(0.58F * amplitude_component[index] + 0.42F * phase_component[index], -6.0F,
+              6.0F) *
+        std::sqrt(carrier_reliability[index]);
+    background_residual[index] = background_input[index];
+    background_total_energy += background_input[index] * background_input[index];
+    ++background_input_count;
+  }
+  float background_explained_energy = 0.0F;
+  for (std::size_t component = 0; component < kBackgroundSubspaceRank; ++component) {
+    float projection = 0.0F;
+    for (std::size_t index = 0; index < frame.sample_count; ++index) {
+      projection += background_basis_[component][index] * background_residual[index];
+    }
+    background_explained_energy += projection * projection;
+    for (std::size_t index = 0; index < frame.sample_count; ++index) {
+      background_residual[index] -= projection * background_basis_[component][index];
+    }
+  }
+  float background_residual_energy = 0.0F;
+  for (std::size_t index = 0; index < frame.sample_count; ++index) {
+    background_residual_energy += background_residual[index] * background_residual[index];
+  }
+  const float background_explained_ratio =
+      background_total_energy > 1.0e-6F
+          ? clamp(background_explained_energy / background_total_energy, 0.0F, 1.0F)
+          : 0.0F;
+  const float innovation_motion =
+      background_input_count > 0U
+          ? clamp(std::sqrt(background_residual_energy /
+                            static_cast<float>(background_input_count)) /
+                      3.0F,
+                  0.0F, 1.0F)
+          : 0.0F;
+  background_motion_ewma_ =
+      0.995F * background_motion_ewma_ + 0.005F * frequency_motion;
+  const bool stable_background =
+      std::fabs(frequency_motion - background_motion_ewma_) < 0.12F && impulse_peak_ < 0.25F;
+  if (stable_background && background_input_count >= 8U) {
+    constexpr float kBackgroundLearningRate = 0.00020F;
+    float update_residual[kMaximumHtSubcarrierCount]{};
+    std::memcpy(update_residual, background_input, sizeof(update_residual));
+    for (std::size_t component = 0; component < kBackgroundSubspaceRank; ++component) {
+      float projection = 0.0F;
+      for (std::size_t index = 0; index < frame.sample_count; ++index) {
+        projection += background_basis_[component][index] * update_residual[index];
+      }
+      for (std::size_t index = 0; index < frame.sample_count; ++index) {
+        background_basis_[component][index] +=
+            kBackgroundLearningRate * projection *
+            (update_residual[index] - projection * background_basis_[component][index]);
+        update_residual[index] -= projection * background_basis_[component][index];
+      }
+    }
+    ++background_update_count_;
+    if ((background_update_count_ % 10U) == 0U) {
+      orthonormalizeBackgroundBasis();
+    }
+  }
+
   float amplitude_projection = 0.0F;
   float phase_projection = 0.0F;
   float weight_energy = 0.0F;
@@ -671,8 +752,8 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   const float dynamic_tap_concentration =
       delay_energy_sum > 1.0e-6F ? clamp(delay_peak / delay_energy_sum, 0.0F, 1.0F) : 0.0F;
   const float frame_motion =
-      clamp(0.30F * amplitude_motion + 0.26F * phase_motion + 0.20F * ratio_motion +
-                0.24F * delay_domain_motion,
+      clamp(0.24F * amplitude_motion + 0.21F * phase_motion + 0.16F * ratio_motion +
+                0.19F * delay_domain_motion + 0.20F * innovation_motion,
             0.0F, 1.0F);
 
   const bool baseline_ready = baseline_frame_count_ >= config_.baseline_min_frames;
@@ -807,6 +888,8 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   summary_delay_motion_ += delay_domain_motion;
   summary_delay_spread_ += delay_spread;
   summary_dynamic_tap_concentration_ += dynamic_tap_concentration;
+  summary_background_explained_ratio_ += background_explained_ratio;
+  summary_innovation_motion_ += innovation_motion;
   summary_amplitude_projection_ += amplitude_projection;
   summary_phase_projection_ += phase_projection;
 
@@ -1032,6 +1115,9 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   observation.delay_spread = summary_delay_spread_ / divisor;
   observation.dynamic_tap_concentration =
       summary_dynamic_tap_concentration_ / divisor;
+  observation.background_explained_ratio =
+      summary_background_explained_ratio_ / divisor;
+  observation.innovation_motion = summary_innovation_motion_ / divisor;
   observation.doppler_energy = doppler_energy;
   observation.doppler_centroid = doppler_centroid;
   observation.doppler_bandwidth = doppler_bandwidth;
@@ -1069,6 +1155,8 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   summary_delay_motion_ = 0.0F;
   summary_delay_spread_ = 0.0F;
   summary_dynamic_tap_concentration_ = 0.0F;
+  summary_background_explained_ratio_ = 0.0F;
+  summary_innovation_motion_ = 0.0F;
   summary_amplitude_projection_ = 0.0F;
   summary_phase_projection_ = 0.0F;
   return CsiPrecisionUpdateStatus::Updated;
@@ -1242,6 +1330,44 @@ float M5AtomCsiLinkProcessor::median(float *values, std::size_t count) {
   return count % 2U == 0U ? 0.5F * (values[middle - 1U] + values[middle]) : values[middle];
 }
 
+void M5AtomCsiLinkProcessor::initializeBackgroundBasis() {
+  for (std::size_t index = 0; index < carrier_count_; ++index) {
+    const float position = static_cast<float>(index) + 1.0F;
+    background_basis_[0][index] = std::sin(position * 0.754877666F);
+    background_basis_[1][index] = std::cos(position * 1.324717957F);
+    background_basis_[2][index] = std::sin(position * 2.414213562F + 0.5F);
+  }
+  orthonormalizeBackgroundBasis();
+}
+
+void M5AtomCsiLinkProcessor::orthonormalizeBackgroundBasis() {
+  for (std::size_t component = 0; component < kBackgroundSubspaceRank; ++component) {
+    for (std::size_t previous = 0; previous < component; ++previous) {
+      float dot = 0.0F;
+      for (std::size_t index = 0; index < carrier_count_; ++index) {
+        dot += background_basis_[component][index] * background_basis_[previous][index];
+      }
+      for (std::size_t index = 0; index < carrier_count_; ++index) {
+        background_basis_[component][index] -= dot * background_basis_[previous][index];
+      }
+    }
+    float norm = 0.0F;
+    for (std::size_t index = 0; index < carrier_count_; ++index) {
+      norm += background_basis_[component][index] * background_basis_[component][index];
+    }
+    norm = std::sqrt(norm);
+    if (norm < 1.0e-6F) {
+      for (std::size_t index = 0; index < carrier_count_; ++index) {
+        background_basis_[component][index] = index == component ? 1.0F : 0.0F;
+      }
+      norm = 1.0F;
+    }
+    for (std::size_t index = 0; index < carrier_count_; ++index) {
+      background_basis_[component][index] /= norm;
+    }
+  }
+}
+
 M5AtomCsiFusion::M5AtomCsiFusion(M5AtomCsiPrecisionConfig config) : config_(config) { reset(); }
 
 void M5AtomCsiFusion::reset() { std::memset(links_, 0, sizeof(links_)); }
@@ -1340,6 +1466,10 @@ bool M5AtomCsiFusion::snapshot(int64_t now_us, FusedCsiObservation &observation)
   observation.delay_spread = robustAggregate(&CsiLinkObservation::delay_spread, indices, count);
   observation.dynamic_tap_concentration =
       robustAggregate(&CsiLinkObservation::dynamic_tap_concentration, indices, count);
+  observation.background_explained_ratio =
+      robustAggregate(&CsiLinkObservation::background_explained_ratio, indices, count);
+  observation.innovation_motion =
+      robustAggregate(&CsiLinkObservation::innovation_motion, indices, count);
   observation.doppler_energy = robustAggregate(&CsiLinkObservation::doppler_energy, indices, count);
   observation.doppler_centroid =
       robustAggregate(&CsiLinkObservation::doppler_centroid, indices, count);
