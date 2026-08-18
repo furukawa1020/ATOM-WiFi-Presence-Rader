@@ -1,0 +1,9 @@
+.pio
+.vscode
+.idea
+*.log
+*.tmp
+build
+*.elf
+*.bin
+*.map
