@@ -51,6 +51,8 @@ CsiLinkObservation observationFromPacket(const CsiObservationPacket &packet) {
   observation.sequence_gap_count = packet.sequence_gap_count;
   observation.snr_db = static_cast<float>(packet.snr_db_x10) * 0.1F;
   observation.valid_ratio = packetMetric(packet, CsiObservationMetric::ValidRatio);
+  observation.subcarrier_reliability =
+      packetMetric(packet, CsiObservationMetric::SubcarrierReliability);
   observation.baseline_maturity = packetMetric(packet, CsiObservationMetric::BaselineMaturity);
   observation.amplitude_motion = packetMetric(packet, CsiObservationMetric::AmplitudeMotion);
   observation.differential_phase_motion =
@@ -58,6 +60,11 @@ CsiLinkObservation observationFromPacket(const CsiObservationPacket &packet) {
   observation.complex_ratio_motion =
       packetMetric(packet, CsiObservationMetric::ComplexRatioMotion);
   observation.phase_coherence = packetMetric(packet, CsiObservationMetric::PhaseCoherence);
+  observation.delay_domain_motion =
+      packetMetric(packet, CsiObservationMetric::DelayDomainMotion);
+  observation.delay_spread = packetMetric(packet, CsiObservationMetric::DelaySpread);
+  observation.dynamic_tap_concentration =
+      packetMetric(packet, CsiObservationMetric::DynamicTapConcentration);
   observation.doppler_energy = packetMetric(packet, CsiObservationMetric::DopplerEnergy);
   observation.respiration_power = packetMetric(packet, CsiObservationMetric::RespirationPower);
   observation.respiration_coherence =
@@ -96,6 +103,8 @@ CsiObservationPacket makeCsiObservationPacket(uint32_t system_id,
   packet.flags = observation.baseline_ready ? kBaselineReadyFlag : 0U;
   packet.metrics[metricIndex(CsiObservationMetric::ValidRatio)] =
       unitToWire(observation.valid_ratio);
+  packet.metrics[metricIndex(CsiObservationMetric::SubcarrierReliability)] =
+      unitToWire(observation.subcarrier_reliability);
   packet.metrics[metricIndex(CsiObservationMetric::BaselineMaturity)] =
       unitToWire(observation.baseline_maturity);
   packet.metrics[metricIndex(CsiObservationMetric::AmplitudeMotion)] =
@@ -106,6 +115,12 @@ CsiObservationPacket makeCsiObservationPacket(uint32_t system_id,
       unitToWire(observation.complex_ratio_motion);
   packet.metrics[metricIndex(CsiObservationMetric::PhaseCoherence)] =
       unitToWire(observation.phase_coherence);
+  packet.metrics[metricIndex(CsiObservationMetric::DelayDomainMotion)] =
+      unitToWire(observation.delay_domain_motion);
+  packet.metrics[metricIndex(CsiObservationMetric::DelaySpread)] =
+      unitToWire(observation.delay_spread);
+  packet.metrics[metricIndex(CsiObservationMetric::DynamicTapConcentration)] =
+      unitToWire(observation.dynamic_tap_concentration);
   packet.metrics[metricIndex(CsiObservationMetric::DopplerEnergy)] =
       unitToWire(observation.doppler_energy);
   packet.metrics[metricIndex(CsiObservationMetric::RespirationPower)] =
@@ -156,6 +171,7 @@ void M5AtomCsiLinkProcessor::reset() {
 
 void M5AtomCsiLinkProcessor::resetSignalState(const ParsedCsiFrame &frame) {
   std::memset(carriers_, 0, sizeof(carriers_));
+  std::memset(delay_taps_, 0, sizeof(delay_taps_));
   std::memset(fast_history_, 0, sizeof(fast_history_));
   std::memset(slow_amplitude_history_, 0, sizeof(slow_amplitude_history_));
   std::memset(slow_phase_history_, 0, sizeof(slow_phase_history_));
@@ -171,6 +187,11 @@ void M5AtomCsiLinkProcessor::resetSignalState(const ParsedCsiFrame &frame) {
     state.ratio_noise_variance = config_.ratio_noise_floor * config_.ratio_noise_floor;
     state.principal_weight =
         std::sin((static_cast<float>(index) + 1.0F) * 1.61803398875F);
+    state.validity_ewma = 1.0F;
+    state.continuity_ewma = 1.0F;
+  }
+  for (DelayTapState &tap : delay_taps_) {
+    tap.noise_variance = config_.delay_noise_floor * config_.delay_noise_floor;
   }
   float norm = 0.0F;
   for (std::size_t index = 0; index < carrier_count_; ++index) {
@@ -196,7 +217,11 @@ void M5AtomCsiLinkProcessor::resetSignalState(const ParsedCsiFrame &frame) {
   summary_baseline_shift_ = 0.0F;
   summary_quality_ = 0.0F;
   summary_valid_ratio_ = 0.0F;
+  summary_subcarrier_reliability_ = 0.0F;
   summary_snr_db_ = 0.0F;
+  summary_delay_motion_ = 0.0F;
+  summary_delay_spread_ = 0.0F;
+  summary_dynamic_tap_concentration_ = 0.0F;
   summary_amplitude_projection_ = 0.0F;
   summary_phase_projection_ = 0.0F;
   previous_projection_ = 0.0F;
@@ -294,6 +319,7 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   float phase_residual[kMaximumHtSubcarrierCount]{};
   float amplitude_component[kMaximumHtSubcarrierCount]{};
   float phase_component[kMaximumHtSubcarrierCount]{};
+  float carrier_reliability[kMaximumHtSubcarrierCount]{};
   float phase_change[kMaximumHtSubcarrierCount]{};
   float ratio_phase_change[kMaximumHtSubcarrierCount]{};
   bool ratio_change_valid[kMaximumHtSubcarrierCount]{};
@@ -303,13 +329,22 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   std::size_t valid_count = 0;
   for (std::size_t index = 0; index < frame.sample_count; ++index) {
     const CsiComplexSample &sample = frame.samples[index];
-    if (!sample.valid_for_features) {
-      continue;
-    }
     const float real = static_cast<float>(sample.real);
     const float imaginary = static_cast<float>(sample.imaginary);
     const float power = real * real + imaginary * imaginary;
-    if (power < 1.0F) {
+    const bool saturated = std::fabs(real) >= 126.0F || std::fabs(imaginary) >= 126.0F;
+    const bool usable = sample.valid_for_features && power >= 1.0F;
+    CarrierState &state = carriers_[index];
+    state.validity_ewma =
+        (1.0F - config_.reliability_adaptation_alpha) * state.validity_ewma +
+        config_.reliability_adaptation_alpha * (usable ? 1.0F : 0.0F);
+    state.saturation_ewma =
+        (1.0F - config_.reliability_adaptation_alpha) * state.saturation_ewma +
+        config_.reliability_adaptation_alpha * (saturated ? 1.0F : 0.0F);
+    state.continuity_ewma =
+        (1.0F - config_.reliability_adaptation_alpha) * state.continuity_ewma +
+        config_.reliability_adaptation_alpha * (usable && state.previous_valid ? 1.0F : 0.0F);
+    if (!usable) {
       continue;
     }
     valid[index] = true;
@@ -373,6 +408,9 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   float baseline_shift_sum = 0.0F;
   float phase_vector_real = 0.0F;
   float phase_vector_imaginary = 0.0F;
+  float temporal_weight_sum = 0.0F;
+  float ratio_weight_sum = 0.0F;
+  float reliability_sum = 0.0F;
   std::size_t temporal_count = 0;
   std::size_t ratio_count = 0;
   int previous_valid_index = -1;
@@ -389,6 +427,17 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
         std::sqrt(variance > config_.amplitude_std_floor * config_.amplitude_std_floor
                       ? variance
                       : config_.amplitude_std_floor * config_.amplitude_std_floor);
+    const float phase_std =
+        std::sqrt(state.phase_noise_variance >
+                          config_.phase_noise_floor_rad * config_.phase_noise_floor_rad
+                      ? state.phase_noise_variance
+                      : config_.phase_noise_floor_rad * config_.phase_noise_floor_rad);
+    const float phase_stability = 1.0F / (1.0F + phase_std / 0.25F);
+    carrier_reliability[index] =
+        clamp(state.validity_ewma * (1.0F - state.saturation_ewma) *
+                  (0.40F + 0.60F * state.continuity_ewma) * phase_stability,
+              0.05F, 1.0F);
+    reliability_sum += carrier_reliability[index];
     const float baseline_z = state.baseline_count > 8U
                                  ? (centered_amplitude[index] - state.amplitude_mean) / amplitude_std
                                  : 0.0F;
@@ -398,18 +447,15 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
       const float amplitude_delta =
           (centered_amplitude[index] - state.previous_amplitude) / amplitude_std;
       phase_change[index] = wrapPhase(phase_residual[index] - state.previous_phase);
-      const float phase_std =
-          std::sqrt(state.phase_noise_variance >
-                            config_.phase_noise_floor_rad * config_.phase_noise_floor_rad
-                        ? state.phase_noise_variance
-                        : config_.phase_noise_floor_rad * config_.phase_noise_floor_rad);
       amplitude_component[index] = clamp(amplitude_delta, -6.0F, 6.0F);
       phase_component[index] = clamp(phase_change[index] / phase_std, -6.0F, 6.0F);
-      amplitude_motion_sum += clamp(std::fabs(amplitude_delta) / 4.0F, 0.0F, 1.0F);
-      phase_motion_sum +=
-          clamp(std::fabs(phase_change[index]) / (4.0F * phase_std), 0.0F, 1.0F);
-      phase_vector_real += std::cos(phase_change[index]);
-      phase_vector_imaginary += std::sin(phase_change[index]);
+      amplitude_motion_sum += carrier_reliability[index] *
+                              clamp(std::fabs(amplitude_delta) / 4.0F, 0.0F, 1.0F);
+      phase_motion_sum += carrier_reliability[index] *
+                          clamp(std::fabs(phase_change[index]) / (4.0F * phase_std), 0.0F, 1.0F);
+      phase_vector_real += carrier_reliability[index] * std::cos(phase_change[index]);
+      phase_vector_imaginary += carrier_reliability[index] * std::sin(phase_change[index]);
+      temporal_weight_sum += carrier_reliability[index];
       ++temporal_count;
     }
 
@@ -438,7 +484,12 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
                             (ratio_phase_change[index] / ratio_std) +
                         (amplitude_change / config_.amplitude_std_floor) *
                             (amplitude_change / config_.amplitude_std_floor));
-          ratio_motion_sum += clamp(normalized / 6.0F, 0.0F, 1.0F);
+          const float pair_reliability =
+              carrier_reliability[index] < carrier_reliability[previous_index]
+                  ? carrier_reliability[index]
+                  : carrier_reliability[previous_index];
+          ratio_motion_sum += pair_reliability * clamp(normalized / 6.0F, 0.0F, 1.0F);
+          ratio_weight_sum += pair_reliability;
           phase_component[index] =
               0.65F * phase_component[index] +
               0.35F * clamp(ratio_phase_change[index] / ratio_std, -6.0F, 6.0F);
@@ -454,22 +505,22 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
     previous_valid_index = static_cast<int>(index);
   }
 
-  const float amplitude_motion = temporal_count > 0U
-                                     ? amplitude_motion_sum / static_cast<float>(temporal_count)
+  const float amplitude_motion = temporal_weight_sum > 1.0e-6F
+                                     ? amplitude_motion_sum / temporal_weight_sum
                                      : 0.0F;
-  const float phase_motion = temporal_count > 0U
-                                 ? phase_motion_sum / static_cast<float>(temporal_count)
+  const float phase_motion = temporal_weight_sum > 1.0e-6F
+                                 ? phase_motion_sum / temporal_weight_sum
                                  : 0.0F;
   const float ratio_motion =
-      ratio_count > 0U ? ratio_motion_sum / static_cast<float>(ratio_count) : 0.0F;
+      ratio_weight_sum > 1.0e-6F ? ratio_motion_sum / ratio_weight_sum : 0.0F;
   const float baseline_shift = baseline_shift_sum / static_cast<float>(valid_count);
   const float phase_coherence =
-      temporal_count > 0U
+      temporal_weight_sum > 1.0e-6F
           ? std::sqrt(phase_vector_real * phase_vector_real +
                       phase_vector_imaginary * phase_vector_imaginary) /
-                static_cast<float>(temporal_count)
+                temporal_weight_sum
           : 0.0F;
-  const float frame_motion =
+  const float frequency_motion =
       clamp(0.38F * amplitude_motion + 0.34F * phase_motion + 0.28F * ratio_motion, 0.0F, 1.0F);
 
   float amplitude_projection = 0.0F;
@@ -479,7 +530,8 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
     if (!valid[index] || !carriers_[index].previous_valid) {
       continue;
     }
-    const float weight = carriers_[index].principal_weight;
+    const float weight =
+        carriers_[index].principal_weight * std::sqrt(carrier_reliability[index]);
     amplitude_projection += weight * amplitude_component[index];
     phase_projection += weight * phase_component[index];
     weight_energy += weight * weight;
@@ -511,6 +563,83 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
       }
     }
   }
+
+  float delay_real[kDelayTapCount]{};
+  float delay_imaginary[kDelayTapCount]{};
+  float delay_energy[kDelayTapCount]{};
+  const float transform_size = frame.bandwidth_mhz == 40U ? 128.0F : 64.0F;
+  for (std::size_t tap_index = 0; tap_index < kDelayTapCount; ++tap_index) {
+    float weight_sum = 0.0F;
+    for (std::size_t carrier_index = 0; carrier_index < frame.sample_count; ++carrier_index) {
+      if (!valid[carrier_index]) {
+        continue;
+      }
+      const float weight = carrier_reliability[carrier_index];
+      const float magnitude = std::exp(clamp(centered_amplitude[carrier_index], -4.0F, 4.0F));
+      const float phase = phase_residual[carrier_index] +
+                          kTwoPi * static_cast<float>(frame.samples[carrier_index].subcarrier) *
+                              static_cast<float>(tap_index) / transform_size;
+      delay_real[tap_index] += weight * magnitude * std::cos(phase);
+      delay_imaginary[tap_index] += weight * magnitude * std::sin(phase);
+      weight_sum += weight;
+    }
+    if (weight_sum > 1.0e-6F) {
+      delay_real[tap_index] /= weight_sum;
+      delay_imaginary[tap_index] /= weight_sum;
+    }
+  }
+
+  float delay_energy_sum = 0.0F;
+  float delay_peak = 0.0F;
+  float delay_index_sum = 0.0F;
+  for (std::size_t tap_index = 0; tap_index < kDelayTapCount; ++tap_index) {
+    const DelayTapState &tap = delay_taps_[tap_index];
+    if (!tap.previous_valid) {
+      continue;
+    }
+    const float temporal_real = delay_real[tap_index] - tap.previous_real;
+    const float temporal_imaginary = delay_imaginary[tap_index] - tap.previous_imaginary;
+    const float temporal_distance =
+        std::sqrt(temporal_real * temporal_real + temporal_imaginary * temporal_imaginary);
+    float static_distance = 0.0F;
+    if (tap.baseline_count > 8U) {
+      const float static_real = delay_real[tap_index] - tap.baseline_real;
+      const float static_imaginary = delay_imaginary[tap_index] - tap.baseline_imaginary;
+      static_distance = std::sqrt(static_real * static_real + static_imaginary * static_imaginary);
+    }
+    const float delay_std =
+        std::sqrt(tap.noise_variance > config_.delay_noise_floor * config_.delay_noise_floor
+                      ? tap.noise_variance
+                      : config_.delay_noise_floor * config_.delay_noise_floor);
+    delay_energy[tap_index] =
+        clamp((0.58F * temporal_distance + 0.42F * static_distance) /
+                  (4.0F * delay_std),
+              0.0F, 1.0F);
+    delay_energy_sum += delay_energy[tap_index];
+    delay_index_sum += delay_energy[tap_index] * static_cast<float>(tap_index);
+    if (delay_energy[tap_index] > delay_peak) {
+      delay_peak = delay_energy[tap_index];
+    }
+  }
+  const float delay_domain_motion = delay_energy_sum / static_cast<float>(kDelayTapCount);
+  const float delay_center = delay_energy_sum > 1.0e-6F ? delay_index_sum / delay_energy_sum : 0.0F;
+  float delay_variance = 0.0F;
+  for (std::size_t tap_index = 0; tap_index < kDelayTapCount; ++tap_index) {
+    const float offset = static_cast<float>(tap_index) - delay_center;
+    delay_variance += delay_energy[tap_index] * offset * offset;
+  }
+  const float delay_spread =
+      delay_energy_sum > 1.0e-6F
+          ? clamp(std::sqrt(delay_variance / delay_energy_sum) /
+                      (0.5F * static_cast<float>(kDelayTapCount)),
+                  0.0F, 1.0F)
+          : 0.0F;
+  const float dynamic_tap_concentration =
+      delay_energy_sum > 1.0e-6F ? clamp(delay_peak / delay_energy_sum, 0.0F, 1.0F) : 0.0F;
+  const float frame_motion =
+      clamp(0.30F * amplitude_motion + 0.26F * phase_motion + 0.20F * ratio_motion +
+                0.24F * delay_domain_motion,
+            0.0F, 1.0F);
 
   const bool baseline_ready = baseline_frame_count_ >= config_.baseline_min_frames;
   const bool baseline_learning =
@@ -558,6 +687,33 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   if (baseline_learning) {
     ++baseline_frame_count_;
   }
+  for (std::size_t tap_index = 0; tap_index < kDelayTapCount; ++tap_index) {
+    DelayTapState &tap = delay_taps_[tap_index];
+    if (baseline_learning && tap.baseline_count < config_.baseline_min_frames) {
+      ++tap.baseline_count;
+      tap.baseline_real +=
+          (delay_real[tap_index] - tap.baseline_real) / static_cast<float>(tap.baseline_count);
+      tap.baseline_imaginary +=
+          (delay_imaginary[tap_index] - tap.baseline_imaginary) /
+          static_cast<float>(tap.baseline_count);
+    } else if (quiet_update) {
+      tap.baseline_real +=
+          config_.baseline_adaptation_alpha * (delay_real[tap_index] - tap.baseline_real);
+      tap.baseline_imaginary += config_.baseline_adaptation_alpha *
+                                (delay_imaginary[tap_index] - tap.baseline_imaginary);
+    }
+    if ((baseline_learning || quiet_update) && tap.previous_valid) {
+      const float delta_real = delay_real[tap_index] - tap.previous_real;
+      const float delta_imaginary = delay_imaginary[tap_index] - tap.previous_imaginary;
+      const float delta_power = delta_real * delta_real + delta_imaginary * delta_imaginary;
+      tap.noise_variance =
+          (1.0F - config_.noise_adaptation_alpha) * tap.noise_variance +
+          config_.noise_adaptation_alpha * delta_power;
+    }
+    tap.previous_real = delay_real[tap_index];
+    tap.previous_imaginary = delay_imaginary[tap_index];
+    tap.previous_valid = true;
+  }
 
   pushFast(combined_projection);
   const float impulse =
@@ -594,7 +750,11 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   summary_baseline_shift_ += baseline_shift_ewma_;
   summary_quality_ += quality;
   summary_valid_ratio_ += valid_ratio;
+  summary_subcarrier_reliability_ += reliability_sum / static_cast<float>(valid_count);
   summary_snr_db_ += snr_db;
+  summary_delay_motion_ += delay_domain_motion;
+  summary_delay_spread_ += delay_spread;
+  summary_dynamic_tap_concentration_ += dynamic_tap_concentration;
   summary_amplitude_projection_ += amplitude_projection;
   summary_phase_projection_ += phase_projection;
 
@@ -708,11 +868,16 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
       summary_sequence_gaps_ > 65535U ? 65535U : summary_sequence_gaps_);
   observation.snr_db = summary_snr_db_ / divisor;
   observation.valid_ratio = summary_valid_ratio_ / divisor;
+  observation.subcarrier_reliability = summary_subcarrier_reliability_ / divisor;
   observation.baseline_maturity = baseline_maturity;
   observation.amplitude_motion = summary_amplitude_motion_ / divisor;
   observation.differential_phase_motion = summary_phase_motion_ / divisor;
   observation.complex_ratio_motion = summary_ratio_motion_ / divisor;
   observation.phase_coherence = summary_phase_coherence_ / divisor;
+  observation.delay_domain_motion = summary_delay_motion_ / divisor;
+  observation.delay_spread = summary_delay_spread_ / divisor;
+  observation.dynamic_tap_concentration =
+      summary_dynamic_tap_concentration_ / divisor;
   observation.doppler_energy = doppler_energy;
   observation.respiration_power = respiration_power;
   observation.respiration_coherence = respiration_coherence;
@@ -733,7 +898,11 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   summary_baseline_shift_ = 0.0F;
   summary_quality_ = 0.0F;
   summary_valid_ratio_ = 0.0F;
+  summary_subcarrier_reliability_ = 0.0F;
   summary_snr_db_ = 0.0F;
+  summary_delay_motion_ = 0.0F;
+  summary_delay_spread_ = 0.0F;
+  summary_dynamic_tap_concentration_ = 0.0F;
   summary_amplitude_projection_ = 0.0F;
   summary_phase_projection_ = 0.0F;
   return CsiPrecisionUpdateStatus::Updated;
@@ -888,6 +1057,13 @@ bool M5AtomCsiFusion::snapshot(int64_t now_us, FusedCsiObservation &observation)
       robustAggregate(&CsiLinkObservation::complex_ratio_motion, indices, count);
   observation.phase_coherence =
       robustAggregate(&CsiLinkObservation::phase_coherence, indices, count);
+  observation.subcarrier_reliability =
+      robustAggregate(&CsiLinkObservation::subcarrier_reliability, indices, count);
+  observation.delay_domain_motion =
+      robustAggregate(&CsiLinkObservation::delay_domain_motion, indices, count);
+  observation.delay_spread = robustAggregate(&CsiLinkObservation::delay_spread, indices, count);
+  observation.dynamic_tap_concentration =
+      robustAggregate(&CsiLinkObservation::dynamic_tap_concentration, indices, count);
   observation.doppler_energy = robustAggregate(&CsiLinkObservation::doppler_energy, indices, count);
   observation.respiration_power =
       robustAggregate(&CsiLinkObservation::respiration_power, indices, count);

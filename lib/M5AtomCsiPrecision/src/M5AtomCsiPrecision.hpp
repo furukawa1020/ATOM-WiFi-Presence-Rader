@@ -21,6 +21,7 @@ class M5AtomCsiLinkProcessor final {
   static constexpr std::size_t kProbeHistoryCapacity = 16;
   static constexpr std::size_t kFastHistoryCapacity = 128;
   static constexpr std::size_t kSlowHistoryCapacity = 256;
+  static constexpr std::size_t kDelayTapCount = 16;
 
   enum class ProbeMatchStatus : uint8_t {
     Matched = 0,
@@ -46,8 +47,21 @@ class M5AtomCsiLinkProcessor final {
     float previous_ratio_phase;
     float previous_ratio_amplitude;
     float principal_weight;
+    float validity_ewma;
+    float saturation_ewma;
+    float continuity_ewma;
     bool previous_valid;
     bool previous_ratio_valid;
+  };
+
+  struct DelayTapState {
+    uint16_t baseline_count;
+    float baseline_real;
+    float baseline_imaginary;
+    float noise_variance;
+    float previous_real;
+    float previous_imaginary;
+    bool previous_valid;
   };
 
   struct MatchedProbe {
@@ -76,6 +90,7 @@ class M5AtomCsiLinkProcessor final {
   bool has_last_matched_probe_{false};
 
   CarrierState carriers_[kMaximumHtSubcarrierCount]{};
+  DelayTapState delay_taps_[kDelayTapCount]{};
   uint16_t carrier_count_{0};
   uint8_t channel_{0};
   uint8_t bandwidth_mhz_{0};
@@ -101,7 +116,11 @@ class M5AtomCsiLinkProcessor final {
   float summary_baseline_shift_{0.0F};
   float summary_quality_{0.0F};
   float summary_valid_ratio_{0.0F};
+  float summary_subcarrier_reliability_{0.0F};
   float summary_snr_db_{0.0F};
+  float summary_delay_motion_{0.0F};
+  float summary_delay_spread_{0.0F};
+  float summary_dynamic_tap_concentration_{0.0F};
   float summary_amplitude_projection_{0.0F};
   float summary_phase_projection_{0.0F};
 

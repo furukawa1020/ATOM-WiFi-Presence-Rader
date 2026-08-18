@@ -9,7 +9,7 @@
 namespace atom::radar {
 
 constexpr std::size_t kMaximumM5AtomCsiReceivers = 3;
-constexpr std::size_t kCsiObservationMetricCount = 14;
+constexpr std::size_t kCsiObservationMetricCount = 18;
 constexpr uint8_t kCsiObservationPacketType = 0x43U;
 
 enum class CsiPrecisionUpdateStatus : uint8_t {
@@ -35,6 +35,8 @@ struct M5AtomCsiPrecisionConfig {
   float quiet_motion_limit{0.22F};
   float baseline_adaptation_alpha{0.0015F};
   float noise_adaptation_alpha{0.010F};
+  float reliability_adaptation_alpha{0.020F};
+  float delay_noise_floor{0.020F};
 };
 
 struct CsiLinkObservation {
@@ -48,11 +50,15 @@ struct CsiLinkObservation {
   uint16_t sequence_gap_count;
   float snr_db;
   float valid_ratio;
+  float subcarrier_reliability;
   float baseline_maturity;
   float amplitude_motion;
   float differential_phase_motion;
   float complex_ratio_motion;
   float phase_coherence;
+  float delay_domain_motion;
+  float delay_spread;
+  float dynamic_tap_concentration;
   float doppler_energy;
   float respiration_power;
   float respiration_coherence;
@@ -72,6 +78,10 @@ struct FusedCsiObservation {
   float differential_phase_motion;
   float complex_ratio_motion;
   float phase_coherence;
+  float subcarrier_reliability;
+  float delay_domain_motion;
+  float delay_spread;
+  float dynamic_tap_concentration;
   float doppler_energy;
   float respiration_power;
   float respiration_coherence;
@@ -86,11 +96,15 @@ struct FusedCsiObservation {
 
 enum class CsiObservationMetric : std::size_t {
   ValidRatio = 0,
+  SubcarrierReliability,
   BaselineMaturity,
   AmplitudeMotion,
   DifferentialPhaseMotion,
   ComplexRatioMotion,
   PhaseCoherence,
+  DelayDomainMotion,
+  DelaySpread,
+  DynamicTapConcentration,
   DopplerEnergy,
   RespirationPower,
   RespirationCoherence,
