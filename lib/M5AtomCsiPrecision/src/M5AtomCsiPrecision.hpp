@@ -107,6 +107,9 @@ class M5AtomCsiLinkProcessor final {
   std::size_t slow_count_{0};
 
   uint16_t summary_frames_{0};
+  uint32_t summary_epoch_{0};
+  uint32_t summary_first_probe_sequence_{0};
+  bool has_summary_epoch_{false};
   uint32_t summary_sequence_gaps_{0};
   float summary_amplitude_motion_{0.0F};
   float summary_phase_motion_{0.0F};

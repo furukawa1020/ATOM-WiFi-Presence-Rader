@@ -488,7 +488,8 @@ static void serviceCoordinatorObservations() {
 
   Serial.printf(
       "{\"type\":\"csi_fusion\",\"active_links\":%u,\"quality\":%.3f,"
-      "\"agreement\":%.3f,\"amplitude\":%.3f,\"phase\":%.3f,"
+      "\"agreement\":%.3f,\"synchronization\":%.3f,"
+      "\"amplitude\":%.3f,\"phase\":%.3f,"
       "\"complex_ratio\":%.3f,\"subcarrier_reliability\":%.3f,"
       "\"delay_motion\":%.3f,\"delay_spread\":%.3f,"
       "\"dynamic_tap_concentration\":%.3f,\"doppler\":%.3f,\"respiration\":%.3f,"
@@ -496,6 +497,7 @@ static void serviceCoordinatorObservations() {
       "\"baseline_shift\":%.3f,\"broadband_nuisance\":%.3f,"
       "\"physically_observable\":%s}\r\n",
       observation.active_links, observation.quality, observation.link_agreement,
+      observation.synchronization_quality,
       observation.amplitude_motion, observation.differential_phase_motion,
       observation.complex_ratio_motion, observation.subcarrier_reliability,
       observation.delay_domain_motion, observation.delay_spread,

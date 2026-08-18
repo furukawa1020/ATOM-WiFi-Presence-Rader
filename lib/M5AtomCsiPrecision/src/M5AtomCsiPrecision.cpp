@@ -45,12 +45,16 @@ CsiLinkObservation observationFromPacket(const CsiObservationPacket &packet) {
   observation.channel = packet.channel;
   observation.bandwidth_mhz = packet.bandwidth_mhz;
   observation.probe_sequence = packet.probe_sequence;
+  observation.window_start_probe_sequence = packet.window_start_probe_sequence;
   observation.observation_sequence = packet.observation_sequence;
   observation.tx_uptime_us = packet.tx_uptime_us;
   observation.frames_in_summary = packet.frames_in_summary;
+  observation.expected_frames_in_summary = packet.expected_frames_in_summary;
   observation.sequence_gap_count = packet.sequence_gap_count;
   observation.snr_db = static_cast<float>(packet.snr_db_x10) * 0.1F;
   observation.valid_ratio = packetMetric(packet, CsiObservationMetric::ValidRatio);
+  observation.window_completeness =
+      packetMetric(packet, CsiObservationMetric::WindowCompleteness);
   observation.subcarrier_reliability =
       packetMetric(packet, CsiObservationMetric::SubcarrierReliability);
   observation.baseline_maturity = packetMetric(packet, CsiObservationMetric::BaselineMaturity);
@@ -93,9 +97,11 @@ CsiObservationPacket makeCsiObservationPacket(uint32_t system_id,
   packet.channel = observation.channel;
   packet.bandwidth_mhz = observation.bandwidth_mhz;
   packet.probe_sequence = observation.probe_sequence;
+  packet.window_start_probe_sequence = observation.window_start_probe_sequence;
   packet.tx_uptime_us = observation.tx_uptime_us;
   packet.observation_sequence = observation.observation_sequence;
   packet.frames_in_summary = observation.frames_in_summary;
+  packet.expected_frames_in_summary = observation.expected_frames_in_summary;
   packet.sequence_gap_count = observation.sequence_gap_count;
   const float snr_x10 = observation.snr_db * 10.0F;
   packet.snr_db_x10 = static_cast<int16_t>(
@@ -103,6 +109,8 @@ CsiObservationPacket makeCsiObservationPacket(uint32_t system_id,
   packet.flags = observation.baseline_ready ? kBaselineReadyFlag : 0U;
   packet.metrics[metricIndex(CsiObservationMetric::ValidRatio)] =
       unitToWire(observation.valid_ratio);
+  packet.metrics[metricIndex(CsiObservationMetric::WindowCompleteness)] =
+      unitToWire(observation.window_completeness);
   packet.metrics[metricIndex(CsiObservationMetric::SubcarrierReliability)] =
       unitToWire(observation.subcarrier_reliability);
   packet.metrics[metricIndex(CsiObservationMetric::BaselineMaturity)] =
@@ -208,6 +216,9 @@ void M5AtomCsiLinkProcessor::resetSignalState(const ParsedCsiFrame &frame) {
   slow_head_ = 0;
   slow_count_ = 0;
   summary_frames_ = 0;
+  summary_epoch_ = 0;
+  summary_first_probe_sequence_ = 0;
+  has_summary_epoch_ = false;
   summary_sequence_gaps_ = 0;
   summary_amplitude_motion_ = 0.0F;
   summary_phase_motion_ = 0.0F;
@@ -740,6 +751,20 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
                 0.15F * continuity,
             0.0F, 1.0F);
 
+  const uint16_t frames_per_summary = static_cast<uint16_t>(
+      config_.summary_rate_hz > 0U
+          ? (config_.target_rate_hz + config_.summary_rate_hz - 1U) / config_.summary_rate_hz
+          : 1U);
+  const uint16_t expected_summary_frames = frames_per_summary > 0U ? frames_per_summary : 1U;
+  const uint32_t current_epoch = probe.sequence / expected_summary_frames;
+  if (!has_summary_epoch_) {
+    summary_epoch_ = current_epoch;
+    has_summary_epoch_ = true;
+  }
+  if (summary_frames_ == 0U) {
+    summary_first_probe_sequence_ = probe.sequence;
+  }
+
   ++summary_frames_;
   summary_sequence_gaps_ += probe.sequence_gap;
   summary_amplitude_motion_ += amplitude_motion;
@@ -758,14 +783,11 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   summary_amplitude_projection_ += amplitude_projection;
   summary_phase_projection_ += phase_projection;
 
-  const uint16_t frames_per_summary = static_cast<uint16_t>(
-      config_.summary_rate_hz > 0U
-          ? (config_.target_rate_hz + config_.summary_rate_hz - 1U) / config_.summary_rate_hz
-          : 1U);
-  if (summary_frames_ < (frames_per_summary > 0U ? frames_per_summary : 1U)) {
+  if (current_epoch == summary_epoch_) {
     return baseline_ready ? CsiPrecisionUpdateStatus::Collecting
                           : CsiPrecisionUpdateStatus::CollectingBaseline;
   }
+  summary_epoch_ = current_epoch;
 
   const float divisor = static_cast<float>(summary_frames_);
   pushSlow(summary_amplitude_projection_ / divisor, summary_phase_projection_ / divisor);
@@ -861,13 +883,24 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   observation.channel = frame.channel;
   observation.bandwidth_mhz = frame.bandwidth_mhz;
   observation.probe_sequence = probe.sequence;
+  observation.window_start_probe_sequence = summary_first_probe_sequence_;
   observation.observation_sequence = observation_sequence_++;
   observation.tx_uptime_us = probe.tx_uptime_us;
   observation.frames_in_summary = summary_frames_;
+  observation.expected_frames_in_summary = expected_summary_frames;
   observation.sequence_gap_count = static_cast<uint16_t>(
       summary_sequence_gaps_ > 65535U ? 65535U : summary_sequence_gaps_);
   observation.snr_db = summary_snr_db_ / divisor;
   observation.valid_ratio = summary_valid_ratio_ / divisor;
+  const uint32_t sequence_span = probe.sequence - summary_first_probe_sequence_ + 1U;
+  const float captured_ratio =
+      clamp(static_cast<float>(summary_frames_) / static_cast<float>(expected_summary_frames),
+            0.0F, 1.0F);
+  const float span_ratio =
+      sequence_span > expected_summary_frames
+          ? static_cast<float>(expected_summary_frames) / static_cast<float>(sequence_span)
+          : 1.0F;
+  observation.window_completeness = clamp(captured_ratio * span_ratio, 0.0F, 1.0F);
   observation.subcarrier_reliability = summary_subcarrier_reliability_ / divisor;
   observation.baseline_maturity = baseline_maturity;
   observation.amplitude_motion = summary_amplitude_motion_ / divisor;
@@ -885,7 +918,9 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   observation.stillness_score = clamp(1.0F - motion_ewma_ * 1.7F, 0.0F, 1.0F);
   observation.baseline_shift = clamp(summary_baseline_shift_ / divisor, 0.0F, 1.0F);
   observation.broadband_nuisance = broadband_ewma_;
-  observation.quality = summary_quality_ / divisor;
+  observation.quality =
+      clamp((summary_quality_ / divisor) * (0.65F + 0.35F * observation.window_completeness),
+            0.0F, 1.0F);
   observation.baseline_ready = baseline_frame_count_ >= config_.baseline_min_frames;
 
   summary_frames_ = 0;
@@ -1020,14 +1055,16 @@ bool M5AtomCsiFusion::ingestPacket(const uint8_t *data, std::size_t length,
 bool M5AtomCsiFusion::snapshot(int64_t now_us, FusedCsiObservation &observation) const {
   observation = {};
   uint64_t newest_tx_uptime = 0;
+  const CsiLinkObservation *anchor = nullptr;
   for (const LinkSlot &slot : links_) {
     if (slot.occupied && now_us - slot.received_at_us <= config_.fusion_freshness_us &&
         slot.observation.tx_uptime_us > newest_tx_uptime) {
       newest_tx_uptime = slot.observation.tx_uptime_us;
       observation.anchor_probe_sequence = slot.observation.probe_sequence;
+      anchor = &slot.observation;
     }
   }
-  if (newest_tx_uptime == 0U) {
+  if (newest_tx_uptime == 0U || anchor == nullptr) {
     return false;
   }
 
@@ -1038,8 +1075,33 @@ bool M5AtomCsiFusion::snapshot(int64_t now_us, FusedCsiObservation &observation)
     if (!slot.occupied || now_us - slot.received_at_us > config_.fusion_freshness_us) {
       continue;
     }
-    const uint64_t age = newest_tx_uptime - slot.observation.tx_uptime_us;
-    if (age <= static_cast<uint64_t>(config_.fusion_alignment_us)) {
+    int32_t sequence_skew = static_cast<int32_t>(observation.anchor_probe_sequence -
+                                                 slot.observation.probe_sequence);
+    if (sequence_skew < 0) {
+      sequence_skew = -sequence_skew;
+    }
+    if (sequence_skew > static_cast<int32_t>(config_.maximum_sequence_skew)) {
+      continue;
+    }
+    const uint32_t overlap_start =
+        anchor->window_start_probe_sequence > slot.observation.window_start_probe_sequence
+            ? anchor->window_start_probe_sequence
+            : slot.observation.window_start_probe_sequence;
+    const uint32_t overlap_end =
+        anchor->probe_sequence < slot.observation.probe_sequence
+            ? anchor->probe_sequence
+            : slot.observation.probe_sequence;
+    const uint32_t anchor_span =
+        anchor->probe_sequence - anchor->window_start_probe_sequence + 1U;
+    const uint32_t candidate_span =
+        slot.observation.probe_sequence - slot.observation.window_start_probe_sequence + 1U;
+    const uint32_t shorter_span = anchor_span < candidate_span ? anchor_span : candidate_span;
+    const uint32_t overlap_span = overlap_end >= overlap_start ? overlap_end - overlap_start + 1U : 0U;
+    const float overlap = shorter_span > 0U
+                              ? static_cast<float>(overlap_span) /
+                                    static_cast<float>(shorter_span)
+                              : 0.0F;
+    if (overlap >= config_.minimum_window_overlap) {
       indices[count++] = index;
     }
   }
@@ -1077,6 +1139,26 @@ bool M5AtomCsiFusion::snapshot(int64_t now_us, FusedCsiObservation &observation)
   observation.broadband_nuisance =
       robustAggregate(&CsiLinkObservation::broadband_nuisance, indices, count);
 
+  float synchronization_sum = 0.0F;
+  float synchronization_weight = 0.0F;
+  for (std::size_t position = 0; position < count; ++position) {
+    const CsiLinkObservation &link = links_[indices[position]].observation;
+    int32_t sequence_skew =
+        static_cast<int32_t>(observation.anchor_probe_sequence - link.probe_sequence);
+    if (sequence_skew < 0) {
+      sequence_skew = -sequence_skew;
+    }
+    const float sequence_alignment =
+        1.0F - clamp01(static_cast<float>(sequence_skew) /
+                       static_cast<float>(config_.maximum_sequence_skew + 1U));
+    synchronization_sum += link.quality * link.window_completeness * sequence_alignment;
+    synchronization_weight += link.quality;
+  }
+  observation.synchronization_quality =
+      clamp01(synchronization_weight > 1.0e-6F
+                  ? synchronization_sum / synchronization_weight
+                  : 0.0F);
+
   float disagreement = 0.0F;
   float quality_weight = 0.0F;
   for (std::size_t position = 0; position < count; ++position) {
@@ -1098,8 +1180,9 @@ bool M5AtomCsiFusion::snapshot(int64_t now_us, FusedCsiObservation &observation)
   const float link_factor =
       0.75F + 0.25F * static_cast<float>(count) /
                   static_cast<float>(kMaximumM5AtomCsiReceivers);
-  observation.quality = clamp01(base_quality * link_factor *
-                                (0.70F + 0.30F * observation.link_agreement));
+  observation.quality =
+      clamp01(base_quality * link_factor * (0.70F + 0.30F * observation.link_agreement) *
+              (0.70F + 0.30F * observation.synchronization_quality));
   observation.physically_observable = observation.quality >= 0.12F;
   return true;
 }
@@ -1128,7 +1211,8 @@ float M5AtomCsiFusion::robustAggregate(float CsiLinkObservation::*member,
     const CsiLinkObservation &link = links_[indices[position]].observation;
     const float value = link.*member;
     const float deviation = std::fabs(value - center) / 0.20F;
-    const float weight = link.quality / (1.0F + deviation * deviation);
+    const float weight =
+        link.quality * link.window_completeness / (1.0F + deviation * deviation);
     weighted_sum += weight * value;
     weight_sum += weight;
   }
