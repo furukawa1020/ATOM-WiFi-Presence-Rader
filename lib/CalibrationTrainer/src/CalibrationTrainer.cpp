@@ -59,6 +59,24 @@ void CalibrationTrainer::reset() {
   run_count_ = 0;
   sample_count_ = 0;
   feature_count_ = 0;
+  feature_schema_ = CalibrationFeatureSchema{};
+}
+
+CalibrationTrainingStatus CalibrationTrainer::bindFeatureSchema(
+    const CalibrationFeatureSchema& schema) {
+  if (schema.schema_id == 0 || schema.version == 0 ||
+      schema.feature_count == 0 ||
+      schema.feature_count > kCalibrationMaxFeatures) {
+    return CalibrationTrainingStatus::InvalidArgument;
+  }
+  if (sample_count_ != 0) {
+    return CalibrationTrainingStatus::FeatureSchemaLocked;
+  }
+
+  feature_schema_ = schema;
+  feature_count_ = schema.feature_count;
+  progress_.feature_count = feature_count_;
+  return CalibrationTrainingStatus::Ok;
 }
 
 CalibrationTrainingStatus CalibrationTrainer::registerRun(
@@ -94,6 +112,12 @@ CalibrationTrainingStatus CalibrationTrainer::appendSample(
   if (features == nullptr || feature_count == 0 ||
       feature_count > kCalibrationMaxFeatures) {
     return CalibrationTrainingStatus::InvalidArgument;
+  }
+  if (feature_schema_.schema_id == 0) {
+    return CalibrationTrainingStatus::FeatureSchemaRequired;
+  }
+  if (feature_count != feature_schema_.feature_count) {
+    return CalibrationTrainingStatus::FeatureCountMismatch;
   }
   if (!isValidTarget(occupied_target) || !isValidTarget(motion_target) ||
       (occupied_target == CalibrationBinaryTarget::Ignore &&
@@ -157,6 +181,9 @@ CalibrationTrainingStatus CalibrationTrainer::appendSample(
 CalibrationTrainingStatus CalibrationTrainer::train(
     CalibratedDetectionModel& output) {
   output = CalibratedDetectionModel{};
+  if (feature_schema_.schema_id == 0) {
+    return CalibrationTrainingStatus::FeatureSchemaRequired;
+  }
   if (feature_count_ == 0) {
     return CalibrationTrainingStatus::MissingTrainingCoverage;
   }
@@ -177,6 +204,7 @@ CalibrationTrainingStatus CalibrationTrainer::train(
     return CalibrationTrainingStatus::MissingFinalCoverage;
   }
 
+  output.feature_schema = feature_schema_;
   output.feature_count = feature_count_;
   output.training_samples = training.samples;
   if (!computeNormalization(output) ||
