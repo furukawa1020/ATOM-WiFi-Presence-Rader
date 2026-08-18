@@ -9,7 +9,7 @@
 namespace atom::radar {
 
 constexpr std::size_t kMaximumM5AtomCsiReceivers = 3;
-constexpr std::size_t kCsiObservationMetricCount = 22;
+constexpr std::size_t kCsiObservationMetricCount = 25;
 constexpr uint8_t kCsiObservationPacketType = 0x43U;
 
 enum class CsiPrecisionUpdateStatus : uint8_t {
@@ -25,7 +25,7 @@ struct M5AtomCsiPrecisionConfig {
   uint16_t target_rate_hz{100};
   uint16_t summary_rate_hz{10};
   uint16_t baseline_min_frames{500};
-  uint16_t respiration_min_summaries{120};
+  uint16_t respiration_min_summaries{192};
   int64_t probe_match_tolerance_us{6500};
   int64_t fusion_freshness_us{500000};
   int64_t fusion_alignment_us{250000};
@@ -69,6 +69,9 @@ struct CsiLinkObservation {
   float doppler_bandwidth;
   float doppler_asymmetry;
   float respiration_power;
+  float respiration_rate_normalized;
+  float respiration_spectral_snr;
+  float respiration_harmonicity;
   float respiration_coherence;
   float impulse_score;
   float stillness_score;
@@ -95,7 +98,11 @@ struct FusedCsiObservation {
   float doppler_bandwidth;
   float doppler_asymmetry;
   float respiration_power;
+  float respiration_rate_normalized;
+  float respiration_spectral_snr;
+  float respiration_harmonicity;
   float respiration_coherence;
+  float respiration_rate_agreement;
   float impulse_score;
   float stillness_score;
   float baseline_shift;
@@ -123,6 +130,9 @@ enum class CsiObservationMetric : std::size_t {
   DopplerBandwidth,
   DopplerAsymmetry,
   RespirationPower,
+  RespirationRateNormalized,
+  RespirationSpectralSnr,
+  RespirationHarmonicity,
   RespirationCoherence,
   ImpulseScore,
   StillnessScore,

@@ -495,7 +495,9 @@ static void serviceCoordinatorObservations() {
       "\"dynamic_tap_concentration\":%.3f,\"doppler\":%.3f,"
       "\"doppler_centroid\":%.3f,\"doppler_bandwidth\":%.3f,"
       "\"doppler_asymmetry\":%.3f,\"respiration\":%.3f,"
-      "\"respiration_coherence\":%.3f,\"impulse\":%.3f,\"stillness\":%.3f,"
+      "\"respiration_rate\":%.3f,\"respiration_snr\":%.3f,"
+      "\"respiration_harmonicity\":%.3f,\"respiration_coherence\":%.3f,"
+      "\"respiration_rate_agreement\":%.3f,\"impulse\":%.3f,\"stillness\":%.3f,"
       "\"baseline_shift\":%.3f,\"broadband_nuisance\":%.3f,"
       "\"physically_observable\":%s}\r\n",
       observation.active_links, observation.quality, observation.link_agreement,
@@ -506,7 +508,9 @@ static void serviceCoordinatorObservations() {
       observation.dynamic_tap_concentration, observation.doppler_energy,
       observation.doppler_centroid, observation.doppler_bandwidth,
       observation.doppler_asymmetry,
-      observation.respiration_power, observation.respiration_coherence,
+      observation.respiration_power, observation.respiration_rate_normalized,
+      observation.respiration_spectral_snr, observation.respiration_harmonicity,
+      observation.respiration_coherence, observation.respiration_rate_agreement,
       observation.impulse_score, observation.stillness_score, observation.baseline_shift,
       observation.broadband_nuisance, observation.physically_observable ? "true" : "false");
 }

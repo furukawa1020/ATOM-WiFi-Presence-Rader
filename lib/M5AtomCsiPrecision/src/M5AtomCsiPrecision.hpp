@@ -77,6 +77,10 @@ class M5AtomCsiLinkProcessor final {
   float spectralPower(const float *history, std::size_t capacity, std::size_t head,
                       std::size_t count, float sample_rate_hz, float frequency_hz) const;
   float complexSpectralPower(float frequency_hz) const;
+  void spectralCoefficient(const float *history, std::size_t capacity, std::size_t head,
+                           std::size_t count, std::size_t start, std::size_t length,
+                           float sample_rate_hz, float frequency_hz, float &real,
+                           float &imaginary) const;
   float historyValue(const float *history, std::size_t capacity, std::size_t head,
                      std::size_t count, std::size_t chronological_index) const;
   static float clamp(float value, float lower, float upper);
