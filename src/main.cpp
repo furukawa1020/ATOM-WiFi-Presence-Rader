@@ -2,6 +2,7 @@
 #include <CsiCapture.hpp>
 #include <CsiFrameParser.hpp>
 #include <CsiPreprocessor.hpp>
+#include <CalibrationManager.hpp>
 #include <EspNowTransport.hpp>
 #include <FeatureExtractor.hpp>
 #include <LocalDetector.hpp>
