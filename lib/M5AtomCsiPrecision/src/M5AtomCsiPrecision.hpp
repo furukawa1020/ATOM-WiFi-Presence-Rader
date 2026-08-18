@@ -22,6 +22,7 @@ class M5AtomCsiLinkProcessor final {
   static constexpr std::size_t kFastHistoryCapacity = 128;
   static constexpr std::size_t kSlowHistoryCapacity = 256;
   static constexpr std::size_t kDelayTapCount = 16;
+  static constexpr std::size_t kBackgroundSubspaceRank = 3;
 
   enum class ProbeMatchStatus : uint8_t {
     Matched = 0,
@@ -72,6 +73,8 @@ class M5AtomCsiLinkProcessor final {
 
   ProbeMatchStatus matchProbe(int64_t received_at_us, MatchedProbe &matched);
   void resetSignalState(const ParsedCsiFrame &frame);
+  void initializeBackgroundBasis();
+  void orthonormalizeBackgroundBasis();
   void pushFast(float value, float complex_real, float complex_imaginary);
   void pushSlow(float amplitude, float phase);
   float spectralPower(const float *history, std::size_t capacity, std::size_t head,
@@ -96,6 +99,8 @@ class M5AtomCsiLinkProcessor final {
 
   CarrierState carriers_[kMaximumHtSubcarrierCount]{};
   DelayTapState delay_taps_[kDelayTapCount]{};
+  float background_basis_[kBackgroundSubspaceRank][kMaximumHtSubcarrierCount]{};
+  uint32_t background_update_count_{0};
   uint16_t carrier_count_{0};
   uint8_t channel_{0};
   uint8_t bandwidth_mhz_{0};
@@ -131,6 +136,8 @@ class M5AtomCsiLinkProcessor final {
   float summary_delay_motion_{0.0F};
   float summary_delay_spread_{0.0F};
   float summary_dynamic_tap_concentration_{0.0F};
+  float summary_background_explained_ratio_{0.0F};
+  float summary_innovation_motion_{0.0F};
   float summary_amplitude_projection_{0.0F};
   float summary_phase_projection_{0.0F};
 
@@ -139,6 +146,7 @@ class M5AtomCsiLinkProcessor final {
   float impulse_peak_{0.0F};
   float baseline_shift_ewma_{0.0F};
   float broadband_ewma_{0.0F};
+  float background_motion_ewma_{0.0F};
   bool has_previous_projection_{false};
 };
 

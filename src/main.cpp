@@ -492,7 +492,8 @@ static void serviceCoordinatorObservations() {
       "\"amplitude\":%.3f,\"phase\":%.3f,"
       "\"complex_ratio\":%.3f,\"subcarrier_reliability\":%.3f,"
       "\"delay_motion\":%.3f,\"delay_spread\":%.3f,"
-      "\"dynamic_tap_concentration\":%.3f,\"doppler\":%.3f,"
+      "\"dynamic_tap_concentration\":%.3f,\"background_explained\":%.3f,"
+      "\"innovation_motion\":%.3f,\"doppler\":%.3f,"
       "\"doppler_centroid\":%.3f,\"doppler_bandwidth\":%.3f,"
       "\"doppler_asymmetry\":%.3f,\"respiration\":%.3f,"
       "\"respiration_rate\":%.3f,\"respiration_snr\":%.3f,"
@@ -505,7 +506,8 @@ static void serviceCoordinatorObservations() {
       observation.amplitude_motion, observation.differential_phase_motion,
       observation.complex_ratio_motion, observation.subcarrier_reliability,
       observation.delay_domain_motion, observation.delay_spread,
-      observation.dynamic_tap_concentration, observation.doppler_energy,
+      observation.dynamic_tap_concentration, observation.background_explained_ratio,
+      observation.innovation_motion, observation.doppler_energy,
       observation.doppler_centroid, observation.doppler_bandwidth,
       observation.doppler_asymmetry,
       observation.respiration_power, observation.respiration_rate_normalized,

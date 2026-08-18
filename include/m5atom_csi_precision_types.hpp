@@ -9,7 +9,7 @@
 namespace atom::radar {
 
 constexpr std::size_t kMaximumM5AtomCsiReceivers = 3;
-constexpr std::size_t kCsiObservationMetricCount = 25;
+constexpr std::size_t kCsiObservationMetricCount = 27;
 constexpr uint8_t kCsiObservationPacketType = 0x43U;
 
 enum class CsiPrecisionUpdateStatus : uint8_t {
@@ -64,6 +64,8 @@ struct CsiLinkObservation {
   float delay_domain_motion;
   float delay_spread;
   float dynamic_tap_concentration;
+  float background_explained_ratio;
+  float innovation_motion;
   float doppler_energy;
   float doppler_centroid;
   float doppler_bandwidth;
@@ -93,6 +95,8 @@ struct FusedCsiObservation {
   float delay_domain_motion;
   float delay_spread;
   float dynamic_tap_concentration;
+  float background_explained_ratio;
+  float innovation_motion;
   float doppler_energy;
   float doppler_centroid;
   float doppler_bandwidth;
@@ -125,6 +129,8 @@ enum class CsiObservationMetric : std::size_t {
   DelayDomainMotion,
   DelaySpread,
   DynamicTapConcentration,
+  BackgroundExplainedRatio,
+  InnovationMotion,
   DopplerEnergy,
   DopplerCentroid,
   DopplerBandwidth,
