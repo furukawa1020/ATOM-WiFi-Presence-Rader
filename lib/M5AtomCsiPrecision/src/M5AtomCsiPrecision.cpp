@@ -74,6 +74,12 @@ CsiLinkObservation observationFromPacket(const CsiObservationPacket &packet) {
   observation.doppler_bandwidth = packetMetric(packet, CsiObservationMetric::DopplerBandwidth);
   observation.doppler_asymmetry = packetMetric(packet, CsiObservationMetric::DopplerAsymmetry);
   observation.respiration_power = packetMetric(packet, CsiObservationMetric::RespirationPower);
+  observation.respiration_rate_normalized =
+      packetMetric(packet, CsiObservationMetric::RespirationRateNormalized);
+  observation.respiration_spectral_snr =
+      packetMetric(packet, CsiObservationMetric::RespirationSpectralSnr);
+  observation.respiration_harmonicity =
+      packetMetric(packet, CsiObservationMetric::RespirationHarmonicity);
   observation.respiration_coherence =
       packetMetric(packet, CsiObservationMetric::RespirationCoherence);
   observation.impulse_score = packetMetric(packet, CsiObservationMetric::ImpulseScore);
@@ -142,6 +148,12 @@ CsiObservationPacket makeCsiObservationPacket(uint32_t system_id,
       unitToWire(observation.doppler_asymmetry);
   packet.metrics[metricIndex(CsiObservationMetric::RespirationPower)] =
       unitToWire(observation.respiration_power);
+  packet.metrics[metricIndex(CsiObservationMetric::RespirationRateNormalized)] =
+      unitToWire(observation.respiration_rate_normalized);
+  packet.metrics[metricIndex(CsiObservationMetric::RespirationSpectralSnr)] =
+      unitToWire(observation.respiration_spectral_snr);
+  packet.metrics[metricIndex(CsiObservationMetric::RespirationHarmonicity)] =
+      unitToWire(observation.respiration_harmonicity);
   packet.metrics[metricIndex(CsiObservationMetric::RespirationCoherence)] =
       unitToWire(observation.respiration_coherence);
   packet.metrics[metricIndex(CsiObservationMetric::ImpulseScore)] =
@@ -860,6 +872,9 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   broadband_ewma_ = 0.85F * broadband_ewma_ + 0.15F * broadband;
 
   float respiration_power = 0.0F;
+  float respiration_rate_normalized = 0.0F;
+  float respiration_spectral_snr = 0.0F;
+  float respiration_harmonicity = 0.0F;
   float respiration_coherence = 0.0F;
   if (slow_count_ >= config_.respiration_min_summaries) {
     constexpr float kRespirationFrequencies[] = {0.12F, 0.16F, 0.20F, 0.25F,
@@ -871,6 +886,8 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
     float phase_sum = 0.0F;
     float amplitude_frequency = 0.0F;
     float phase_frequency = 0.0F;
+    float combined_peak = 0.0F;
+    float best_frequency = 0.0F;
     for (float frequency : kRespirationFrequencies) {
       const float amplitude_power =
           spectralPower(slow_amplitude_history_, kSlowHistoryCapacity, slow_head_, slow_count_,
@@ -880,6 +897,11 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
                         static_cast<float>(config_.summary_rate_hz), frequency);
       amplitude_sum += amplitude_power;
       phase_sum += phase_power;
+      const float combined_power = amplitude_power + phase_power;
+      if (combined_power > combined_peak) {
+        combined_peak = combined_power;
+        best_frequency = frequency;
+      }
       if (amplitude_power > amplitude_peak) {
         amplitude_peak = amplitude_power;
         amplitude_frequency = frequency;
@@ -905,6 +927,9 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
         amplitude_peak / (amplitude_noise + 1.0e-6F) > phase_peak / (phase_noise + 1.0e-6F)
             ? amplitude_peak / (amplitude_noise + 1.0e-6F)
             : phase_peak / (phase_noise + 1.0e-6F);
+    respiration_spectral_snr = clamp(std::log10(1.0F + best_snr) / 2.0F, 0.0F, 1.0F);
+    respiration_rate_normalized =
+        clamp((best_frequency - 0.10F) / 0.40F, 0.0F, 1.0F);
     const float peak_strength =
         std::sqrt(amplitude_peak > phase_peak ? amplitude_peak : phase_peak);
     const float window_maturity =
@@ -915,15 +940,63 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
         clamp((std::log10(1.0F + best_snr) / 1.4F) *
                   clamp(peak_strength / 0.55F, 0.0F, 1.0F) * window_maturity,
               0.0F, 1.0F);
+    if (best_frequency > 0.0F) {
+      const float harmonic_frequency = best_frequency * 2.0F;
+      const float harmonic_amplitude =
+          spectralPower(slow_amplitude_history_, kSlowHistoryCapacity, slow_head_, slow_count_,
+                        static_cast<float>(config_.summary_rate_hz), harmonic_frequency);
+      const float harmonic_phase =
+          spectralPower(slow_phase_history_, kSlowHistoryCapacity, slow_head_, slow_count_,
+                        static_cast<float>(config_.summary_rate_hz), harmonic_frequency);
+      const float harmonic_power = harmonic_amplitude + harmonic_phase;
+      respiration_harmonicity =
+          clamp(harmonic_power / (combined_peak + harmonic_power + 1.0e-6F), 0.0F, 1.0F);
+    }
     const float amplitude_concentration =
         amplitude_sum > 1.0e-6F ? amplitude_peak / amplitude_sum : 0.0F;
     const float phase_concentration = phase_sum > 1.0e-6F ? phase_peak / phase_sum : 0.0F;
     const float frequency_agreement =
         std::exp(-std::fabs(amplitude_frequency - phase_frequency) / 0.08F);
+    constexpr std::size_t kCrossSpectrumSegmentLength = 128;
+    const std::size_t segment_starts[] = {
+        0U,
+        (slow_count_ - kCrossSpectrumSegmentLength) / 2U,
+        slow_count_ - kCrossSpectrumSegmentLength,
+    };
+    float cross_real = 0.0F;
+    float cross_imaginary = 0.0F;
+    float amplitude_energy = 0.0F;
+    float phase_energy = 0.0F;
+    for (std::size_t segment_start : segment_starts) {
+      float amplitude_real = 0.0F;
+      float amplitude_imaginary = 0.0F;
+      float phase_real = 0.0F;
+      float phase_imaginary = 0.0F;
+      spectralCoefficient(slow_amplitude_history_, kSlowHistoryCapacity, slow_head_, slow_count_,
+                          segment_start, kCrossSpectrumSegmentLength,
+                          static_cast<float>(config_.summary_rate_hz), best_frequency,
+                          amplitude_real, amplitude_imaginary);
+      spectralCoefficient(slow_phase_history_, kSlowHistoryCapacity, slow_head_, slow_count_,
+                          segment_start, kCrossSpectrumSegmentLength,
+                          static_cast<float>(config_.summary_rate_hz), best_frequency, phase_real,
+                          phase_imaginary);
+      cross_real += amplitude_real * phase_real + amplitude_imaginary * phase_imaginary;
+      cross_imaginary += amplitude_imaginary * phase_real - amplitude_real * phase_imaginary;
+      amplitude_energy += amplitude_real * amplitude_real +
+                          amplitude_imaginary * amplitude_imaginary;
+      phase_energy += phase_real * phase_real + phase_imaginary * phase_imaginary;
+    }
+    const float cross_magnitude_squared =
+        cross_real * cross_real + cross_imaginary * cross_imaginary;
+    const float magnitude_squared_coherence =
+        cross_magnitude_squared /
+        (amplitude_energy * phase_energy + 1.0e-6F);
+    const float quiet_factor = clamp(1.0F - 2.0F * motion_ewma_, 0.0F, 1.0F);
     respiration_coherence =
-        clamp(frequency_agreement *
+        clamp(magnitude_squared_coherence * frequency_agreement *
                   std::sqrt(clamp(amplitude_concentration, 0.0F, 1.0F) *
-                            clamp(phase_concentration, 0.0F, 1.0F)),
+                            clamp(phase_concentration, 0.0F, 1.0F)) *
+                  (0.35F + 0.65F * quiet_factor),
               0.0F, 1.0F);
   }
 
@@ -964,6 +1037,9 @@ CsiPrecisionUpdateStatus M5AtomCsiLinkProcessor::update(const ParsedCsiFrame &fr
   observation.doppler_bandwidth = doppler_bandwidth;
   observation.doppler_asymmetry = doppler_asymmetry;
   observation.respiration_power = respiration_power;
+  observation.respiration_rate_normalized = respiration_rate_normalized;
+  observation.respiration_spectral_snr = respiration_spectral_snr;
+  observation.respiration_harmonicity = respiration_harmonicity;
   observation.respiration_coherence = respiration_coherence;
   const float temporal_impulse = clamp(summary_impulse_ / divisor, 0.0F, 1.0F);
   observation.impulse_score =
@@ -1100,6 +1176,39 @@ float M5AtomCsiLinkProcessor::spectralPower(const float *history, std::size_t ca
   }
   const float normalization = window_sum > 1.0e-6F ? 2.0F / window_sum : 0.0F;
   return (real * real + imaginary * imaginary) * normalization * normalization;
+}
+
+void M5AtomCsiLinkProcessor::spectralCoefficient(
+    const float *history, std::size_t capacity, std::size_t head, std::size_t count,
+    std::size_t start, std::size_t length, float sample_rate_hz, float frequency_hz, float &real,
+    float &imaginary) const {
+  real = 0.0F;
+  imaginary = 0.0F;
+  if (length < 16U || start + length > count || sample_rate_hz <= 0.0F ||
+      frequency_hz <= 0.0F) {
+    return;
+  }
+  float mean = 0.0F;
+  for (std::size_t index = 0; index < length; ++index) {
+    mean += historyValue(history, capacity, head, count, start + index);
+  }
+  mean /= static_cast<float>(length);
+  float window_sum = 0.0F;
+  for (std::size_t index = 0; index < length; ++index) {
+    const float phase = kTwoPi * frequency_hz * static_cast<float>(index) / sample_rate_hz;
+    const float window =
+        0.5F - 0.5F *
+                   std::cos(kTwoPi * static_cast<float>(index) /
+                            static_cast<float>(length - 1U));
+    const float sample = historyValue(history, capacity, head, count, start + index) - mean;
+    real += sample * window * std::cos(phase);
+    imaginary -= sample * window * std::sin(phase);
+    window_sum += window;
+  }
+  if (window_sum > 1.0e-6F) {
+    real *= 2.0F / window_sum;
+    imaginary *= 2.0F / window_sum;
+  }
 }
 
 float M5AtomCsiLinkProcessor::clamp(float value, float lower, float upper) {
@@ -1240,8 +1349,53 @@ bool M5AtomCsiFusion::snapshot(int64_t now_us, FusedCsiObservation &observation)
       robustAggregate(&CsiLinkObservation::doppler_asymmetry, indices, count);
   observation.respiration_power =
       robustAggregate(&CsiLinkObservation::respiration_power, indices, count);
+  observation.respiration_spectral_snr =
+      robustAggregate(&CsiLinkObservation::respiration_spectral_snr, indices, count);
+  observation.respiration_harmonicity =
+      robustAggregate(&CsiLinkObservation::respiration_harmonicity, indices, count);
   observation.respiration_coherence =
       robustAggregate(&CsiLinkObservation::respiration_coherence, indices, count);
+  float strongest_respiration_evidence = 0.0F;
+  float reference_respiration_rate = 0.0F;
+  for (std::size_t position = 0; position < count; ++position) {
+    const CsiLinkObservation &link = links_[indices[position]].observation;
+    const float evidence = link.quality * link.respiration_power *
+                           link.respiration_coherence * link.respiration_spectral_snr;
+    if (evidence > strongest_respiration_evidence) {
+      strongest_respiration_evidence = evidence;
+      reference_respiration_rate = link.respiration_rate_normalized;
+    }
+  }
+  float respiration_rate_sum = 0.0F;
+  float respiration_rate_weight = 0.0F;
+  for (std::size_t position = 0; position < count; ++position) {
+    const CsiLinkObservation &link = links_[indices[position]].observation;
+    const float evidence = link.quality * link.respiration_power *
+                           link.respiration_coherence * link.respiration_spectral_snr;
+    const float rate_delta =
+        std::fabs(link.respiration_rate_normalized - reference_respiration_rate);
+    const float robust_weight = evidence / (1.0F + (rate_delta / 0.12F) * (rate_delta / 0.12F));
+    respiration_rate_sum += robust_weight * link.respiration_rate_normalized;
+    respiration_rate_weight += robust_weight;
+  }
+  observation.respiration_rate_normalized =
+      respiration_rate_weight > 1.0e-6F
+          ? clamp01(respiration_rate_sum / respiration_rate_weight)
+          : 0.0F;
+  float respiration_rate_variance = 0.0F;
+  for (std::size_t position = 0; position < count; ++position) {
+    const CsiLinkObservation &link = links_[indices[position]].observation;
+    const float evidence = link.quality * link.respiration_power *
+                           link.respiration_coherence * link.respiration_spectral_snr;
+    const float delta =
+        link.respiration_rate_normalized - observation.respiration_rate_normalized;
+    respiration_rate_variance += evidence * delta * delta;
+  }
+  observation.respiration_rate_agreement =
+      respiration_rate_weight > 1.0e-6F
+          ? clamp01(1.0F -
+                    std::sqrt(respiration_rate_variance / respiration_rate_weight) / 0.15F)
+          : 0.0F;
   observation.impulse_score = robustAggregate(&CsiLinkObservation::impulse_score, indices, count);
   observation.stillness_score =
       robustAggregate(&CsiLinkObservation::stillness_score, indices, count);
