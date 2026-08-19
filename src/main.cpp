@@ -12,6 +12,7 @@
 #include <AdaptiveTemporalEncoder.hpp>
 #include <BathroomCsiEvidence.hpp>
 #include <BathroomRespirationEvidence.hpp>
+#include <BathroomRoomCalibration.hpp>
 #include <BathroomSafetyEvidence.hpp>
 #include <BathroomSpatialEvidence.hpp>
 #include <EspNowTransport.hpp>
@@ -91,6 +92,10 @@ static atom::radar::BathroomRespirationEvidenceAnalyzer
 static atom::radar::BathroomRespirationEvidence
     g_latest_bathroom_respiration_evidence{};
 static bool g_has_bathroom_respiration_evidence = false;
+static atom::radar::BathroomRoomCalibration g_bathroom_room_calibration;
+static atom::radar::BathroomRoomCalibrationEvidence
+    g_latest_bathroom_room_calibration{};
+static bool g_has_bathroom_room_calibration = false;
 static atom::radar::RadioController g_radio;
 static atom::radar::SubcarrierSelection g_subcarrier_selection{};
 static bool g_pairing_ready = false;
@@ -537,6 +542,22 @@ static void serviceCoordinatorObservations() {
                 g_latest_bathroom_respiration_evidence =
                     respiration_evidence;
                 g_has_bathroom_respiration_evidence = true;
+                atom::radar::BathroomRoomCalibrationEvidence
+                    calibrated_evidence{};
+                const atom::radar::BathroomRoomCalibrationUpdateStatus
+                    calibration_status = g_bathroom_room_calibration.update(
+                        fused_observation, frame.received_at_us, evidence,
+                        safety_evidence, spatial_evidence,
+                        respiration_evidence, calibrated_evidence);
+                if (calibration_status ==
+                        atom::radar::BathroomRoomCalibrationUpdateStatus::
+                            Updated ||
+                    calibration_status ==
+                        atom::radar::BathroomRoomCalibrationUpdateStatus::
+                            ReplacedSameProbe) {
+                  g_latest_bathroom_room_calibration = calibrated_evidence;
+                  g_has_bathroom_room_calibration = true;
+                }
               }
             }
           }
