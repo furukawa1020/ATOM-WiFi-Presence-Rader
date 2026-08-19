@@ -11,6 +11,7 @@
 #include <CalibrationStartupController.hpp>
 #include <AdaptiveTemporalEncoder.hpp>
 #include <BathroomCsiEvidence.hpp>
+#include <BathroomSafetyEvidence.hpp>
 #include <EspNowTransport.hpp>
 #include <FeatureExtractor.hpp>
 #include <LocalDetector.hpp>
@@ -77,6 +78,9 @@ static atom::radar::M5AtomCsiFusion g_m5atom_csi_fusion;
 static atom::radar::BathroomCsiEvidenceAnalyzer g_bathroom_csi_evidence_analyzer;
 static atom::radar::BathroomCsiEvidence g_latest_bathroom_csi_evidence{};
 static bool g_has_bathroom_csi_evidence = false;
+static atom::radar::BathroomSafetyEvidenceAnalyzer g_bathroom_safety_evidence_analyzer;
+static atom::radar::BathroomSafetyEvidence g_latest_bathroom_safety_evidence{};
+static bool g_has_bathroom_safety_evidence = false;
 static atom::radar::RadioController g_radio;
 static atom::radar::SubcarrierSelection g_subcarrier_selection{};
 static bool g_pairing_ready = false;
@@ -480,6 +484,18 @@ static void serviceCoordinatorObservations() {
                 atom::radar::BathroomCsiEvidenceUpdateStatus::ReplacedSameProbe) {
           g_latest_bathroom_csi_evidence = evidence;
           g_has_bathroom_csi_evidence = true;
+          atom::radar::BathroomSafetyEvidence safety_evidence{};
+          const atom::radar::BathroomSafetyEvidenceUpdateStatus safety_status =
+              g_bathroom_safety_evidence_analyzer.update(
+                  fused_observation, frame.received_at_us, evidence,
+                  safety_evidence);
+          if (safety_status ==
+                  atom::radar::BathroomSafetyEvidenceUpdateStatus::Updated ||
+              safety_status == atom::radar::BathroomSafetyEvidenceUpdateStatus::
+                                   ReplacedSameProbe) {
+            g_latest_bathroom_safety_evidence = safety_evidence;
+            g_has_bathroom_safety_evidence = true;
+          }
         }
       }
     } else {
