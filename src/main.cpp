@@ -12,6 +12,7 @@
 #include <AdaptiveTemporalEncoder.hpp>
 #include <BathroomCsiEvidence.hpp>
 #include <BathroomSafetyEvidence.hpp>
+#include <BathroomSpatialEvidence.hpp>
 #include <EspNowTransport.hpp>
 #include <FeatureExtractor.hpp>
 #include <LocalDetector.hpp>
@@ -81,6 +82,9 @@ static bool g_has_bathroom_csi_evidence = false;
 static atom::radar::BathroomSafetyEvidenceAnalyzer g_bathroom_safety_evidence_analyzer;
 static atom::radar::BathroomSafetyEvidence g_latest_bathroom_safety_evidence{};
 static bool g_has_bathroom_safety_evidence = false;
+static atom::radar::BathroomSpatialEvidenceAnalyzer g_bathroom_spatial_evidence_analyzer;
+static atom::radar::BathroomSpatialEvidence g_latest_bathroom_spatial_evidence{};
+static bool g_has_bathroom_spatial_evidence = false;
 static atom::radar::RadioController g_radio;
 static atom::radar::SubcarrierSelection g_subcarrier_selection{};
 static bool g_pairing_ready = false;
@@ -470,6 +474,8 @@ static void serviceReceiverObservationTx() {
 static void serviceCoordinatorObservations() {
   atom::radar::EspNowFrame frame{};
   while (g_esp_now.receive(frame)) {
+    g_bathroom_spatial_evidence_analyzer.ingestPacket(
+        frame.data, frame.length, g_system_id, frame.received_at_us);
     if (g_m5atom_csi_fusion.ingestPacket(frame.data, frame.length, g_system_id,
                                          frame.received_at_us)) {
       ++g_csi_processing_counters.fused_observations;
@@ -495,6 +501,19 @@ static void serviceCoordinatorObservations() {
                                    ReplacedSameProbe) {
             g_latest_bathroom_safety_evidence = safety_evidence;
             g_has_bathroom_safety_evidence = true;
+            atom::radar::BathroomSpatialEvidence spatial_evidence{};
+            const atom::radar::BathroomSpatialEvidenceUpdateStatus spatial_status =
+                g_bathroom_spatial_evidence_analyzer.update(
+                    fused_observation, frame.received_at_us, evidence,
+                    safety_evidence, spatial_evidence);
+            if (spatial_status ==
+                    atom::radar::BathroomSpatialEvidenceUpdateStatus::Updated ||
+                spatial_status == atom::radar::
+                                      BathroomSpatialEvidenceUpdateStatus::
+                                          ReplacedSameProbe) {
+              g_latest_bathroom_spatial_evidence = spatial_evidence;
+              g_has_bathroom_spatial_evidence = true;
+            }
           }
         }
       }
