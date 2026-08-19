@@ -11,6 +11,7 @@
 #include <CalibrationStartupController.hpp>
 #include <AdaptiveTemporalEncoder.hpp>
 #include <BathroomCsiEvidence.hpp>
+#include <BathroomBathingSession.hpp>
 #include <BathroomRespirationEvidence.hpp>
 #include <BathroomRoomCalibration.hpp>
 #include <BathroomSafetyEvidence.hpp>
@@ -96,6 +97,11 @@ static atom::radar::BathroomRoomCalibration g_bathroom_room_calibration;
 static atom::radar::BathroomRoomCalibrationEvidence
     g_latest_bathroom_room_calibration{};
 static bool g_has_bathroom_room_calibration = false;
+static atom::radar::BathroomBathingSessionTracker
+    g_bathroom_bathing_session_tracker;
+static atom::radar::BathroomBathingSessionEvidence
+    g_latest_bathroom_bathing_session{};
+static bool g_has_bathroom_bathing_session = false;
 static atom::radar::RadioController g_radio;
 static atom::radar::SubcarrierSelection g_subcarrier_selection{};
 static bool g_pairing_ready = false;
@@ -557,6 +563,23 @@ static void serviceCoordinatorObservations() {
                             ReplacedSameProbe) {
                   g_latest_bathroom_room_calibration = calibrated_evidence;
                   g_has_bathroom_room_calibration = true;
+                  atom::radar::BathroomBathingSessionEvidence session_evidence{};
+                  const atom::radar::BathroomBathingSessionUpdateStatus
+                      session_status =
+                          g_bathroom_bathing_session_tracker.update(
+                              fused_observation, frame.received_at_us,
+                              evidence, safety_evidence, spatial_evidence,
+                              respiration_evidence, calibrated_evidence,
+                              session_evidence);
+                  if (session_status ==
+                          atom::radar::BathroomBathingSessionUpdateStatus::
+                              Updated ||
+                      session_status ==
+                          atom::radar::BathroomBathingSessionUpdateStatus::
+                              ReplacedSameProbe) {
+                    g_latest_bathroom_bathing_session = session_evidence;
+                    g_has_bathroom_bathing_session = true;
+                  }
                 }
               }
             }
