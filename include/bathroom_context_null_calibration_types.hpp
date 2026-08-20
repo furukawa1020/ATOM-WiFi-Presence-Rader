@@ -48,12 +48,20 @@ struct BathroomContextNullCalibrationEvidence {
   float context_confidence = 0.0F;
   float profile_maturity = 0.0F;
   float update_quality = 0.0F;
+  uint32_t profile_generation = 0U;
+  uint32_t updates_since_checkpoint = 0U;
+  uint32_t checkpoint_age_ms = 0U;
 
   bool null_update_allowed = false;
   bool null_profile_updated = false;
   bool calibration_applied = false;
   bool danger_lock = false;
   bool physically_observable = false;
+  bool storage_available = false;
+  bool persisted_profile_loaded = false;
+  bool recovered_from_single_slot = false;
+  bool profile_dirty = false;
+  bool checkpoint_ok = false;
   bool evidence_ready = false;
 };
 
