@@ -12,6 +12,7 @@
 #include <AdaptiveTemporalEncoder.hpp>
 #include <BathroomCsiEvidence.hpp>
 #include <BathroomBathingSession.hpp>
+#include <BathroomContextNullCalibration.hpp>
 #include <BathroomIntegratedSafety.hpp>
 #include <BathroomRespirationEvidence.hpp>
 #include <BathroomRoomCalibration.hpp>
@@ -108,6 +109,11 @@ static atom::radar::BathroomIntegratedSafetyAnalyzer
 static atom::radar::BathroomIntegratedSafetyEvidence
     g_latest_bathroom_integrated_safety{};
 static bool g_has_bathroom_integrated_safety = false;
+static atom::radar::BathroomContextNullCalibration
+    g_bathroom_context_null_calibration;
+static atom::radar::BathroomContextNullCalibrationEvidence
+    g_latest_bathroom_context_null_calibration{};
+static bool g_has_bathroom_context_null_calibration = false;
 static atom::radar::RadioController g_radio;
 static atom::radar::SubcarrierSelection g_subcarrier_selection{};
 static bool g_pairing_ready = false;
@@ -602,6 +608,24 @@ static void serviceCoordinatorObservations() {
                       g_latest_bathroom_integrated_safety =
                           integrated_safety_evidence;
                       g_has_bathroom_integrated_safety = true;
+                      atom::radar::BathroomContextNullCalibrationEvidence
+                          null_calibration_evidence{};
+                      const atom::radar::
+                          BathroomContextNullCalibrationUpdateStatus
+                              null_calibration_status =
+                                  g_bathroom_context_null_calibration.update(
+                                      evidence, safety_evidence,
+                                      respiration_evidence, session_evidence,
+                                      integrated_safety_evidence,
+                                      null_calibration_evidence);
+                      if (null_calibration_status ==
+                          atom::radar::
+                              BathroomContextNullCalibrationUpdateStatus::
+                                  Accepted) {
+                        g_latest_bathroom_context_null_calibration =
+                            null_calibration_evidence;
+                        g_has_bathroom_context_null_calibration = true;
+                      }
                     }
                   }
                 }
