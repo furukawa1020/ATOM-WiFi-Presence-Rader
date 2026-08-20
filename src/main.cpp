@@ -12,6 +12,7 @@
 #include <AdaptiveTemporalEncoder.hpp>
 #include <BathroomCsiEvidence.hpp>
 #include <BathroomBathingSession.hpp>
+#include <BathroomIntegratedSafety.hpp>
 #include <BathroomRespirationEvidence.hpp>
 #include <BathroomRoomCalibration.hpp>
 #include <BathroomSafetyEvidence.hpp>
@@ -102,6 +103,11 @@ static atom::radar::BathroomBathingSessionTracker
 static atom::radar::BathroomBathingSessionEvidence
     g_latest_bathroom_bathing_session{};
 static bool g_has_bathroom_bathing_session = false;
+static atom::radar::BathroomIntegratedSafetyAnalyzer
+    g_bathroom_integrated_safety_analyzer;
+static atom::radar::BathroomIntegratedSafetyEvidence
+    g_latest_bathroom_integrated_safety{};
+static bool g_has_bathroom_integrated_safety = false;
 static atom::radar::RadioController g_radio;
 static atom::radar::SubcarrierSelection g_subcarrier_selection{};
 static bool g_pairing_ready = false;
@@ -579,6 +585,24 @@ static void serviceCoordinatorObservations() {
                               ReplacedSameProbe) {
                     g_latest_bathroom_bathing_session = session_evidence;
                     g_has_bathroom_bathing_session = true;
+                    atom::radar::BathroomIntegratedSafetyEvidence
+                        integrated_safety_evidence{};
+                    const atom::radar::
+                        BathroomIntegratedSafetyUpdateStatus
+                            integrated_safety_status =
+                                g_bathroom_integrated_safety_analyzer.update(
+                                    fused_observation, evidence,
+                                    safety_evidence, spatial_evidence,
+                                    respiration_evidence, calibrated_evidence,
+                                    session_evidence,
+                                    integrated_safety_evidence);
+                    if (integrated_safety_status ==
+                        atom::radar::
+                            BathroomIntegratedSafetyUpdateStatus::Accepted) {
+                      g_latest_bathroom_integrated_safety =
+                          integrated_safety_evidence;
+                      g_has_bathroom_integrated_safety = true;
+                    }
                   }
                 }
               }
