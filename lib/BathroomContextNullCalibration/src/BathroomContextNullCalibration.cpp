@@ -1,17 +1,33 @@
 #include "BathroomContextNullCalibration.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 
 #include <Arduino.h>
+#include <Preferences.h>
 
 namespace atom::radar {
 namespace {
 
 constexpr uint64_t kUsPerMs = 1000ULL;
+constexpr uint32_t kProfileMagic = 0x4E43414CUL;
+constexpr uint16_t kProfileFormatVersion = 1U;
+constexpr char kStorageNamespace[] = "ctxnull";
+constexpr char kSlotAKey[] = "profile_a";
+constexpr char kSlotBKey[] = "profile_b";
 
 size_t contextIndex(BathroomNullContext context) {
   return static_cast<size_t>(context);
+}
+
+uint32_t elapsedMilliseconds(uint64_t now_us, uint64_t since_us) {
+  if (since_us == 0U || now_us <= since_us) {
+    return 0U;
+  }
+  const uint64_t elapsed_ms = (now_us - since_us) / kUsPerMs;
+  return elapsed_ms > UINT32_MAX ? UINT32_MAX
+                                 : static_cast<uint32_t>(elapsed_ms);
 }
 
 }  // namespace
@@ -302,6 +318,211 @@ void BathroomContextNullCalibration::copyProfiles(
   }
 }
 
+uint32_t BathroomContextNullCalibration::calculateCrc32(
+    const uint8_t* data,
+    size_t length) {
+  uint32_t crc = 0xFFFFFFFFUL;
+  for (size_t i = 0U; i < length; ++i) {
+    crc ^= data[i];
+    for (uint8_t bit = 0U; bit < 8U; ++bit) {
+      const uint32_t mask =
+          static_cast<uint32_t>(-static_cast<int32_t>(crc & 1U));
+      crc = (crc >> 1U) ^ (0xEDB88320UL & mask);
+    }
+  }
+  return ~crc;
+}
+
+bool BathroomContextNullCalibration::generationIsNewer(
+    uint32_t candidate,
+    uint32_t reference) {
+  return static_cast<int32_t>(candidate - reference) > 0;
+}
+
+bool BathroomContextNullCalibration::validatePersistedProfile(
+    const PersistedProfile& profile) const {
+  if (profile.magic != kProfileMagic ||
+      profile.format_version != kProfileFormatVersion ||
+      profile.structure_size != sizeof(PersistedProfile)) {
+    return false;
+  }
+  const uint32_t expected_crc = calculateCrc32(
+      reinterpret_cast<const uint8_t*>(&profile),
+      offsetof(PersistedProfile, crc32));
+  if (profile.crc32 != expected_crc) {
+    return false;
+  }
+
+  for (size_t context = 0U; context < kContextCount; ++context) {
+    for (size_t feature = 0U; feature < kFeatureCount; ++feature) {
+      const PersistedStatistic& statistic =
+          profile.statistics[context][feature];
+      if (!std::isfinite(statistic.mean) ||
+          !std::isfinite(statistic.variance) ||
+          statistic.mean < 0.0F || statistic.mean > 1.0F ||
+          statistic.variance < 0.0F || statistic.variance > 1.0F ||
+          statistic.samples > config_.maximum_sample_count) {
+        return false;
+      }
+      if (statistic.samples > 0U &&
+          statistic.variance <
+              config_.scale_floor * config_.scale_floor) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool BathroomContextNullCalibration::readSlot(
+    Preferences& preferences,
+    const char* key,
+    PersistedProfile& profile) const {
+  if (preferences.getBytesLength(key) != sizeof(PersistedProfile)) {
+    return false;
+  }
+  PersistedProfile candidate{};
+  if (preferences.getBytes(key, &candidate, sizeof(candidate)) !=
+      sizeof(candidate)) {
+    return false;
+  }
+  if (!validatePersistedProfile(candidate)) {
+    return false;
+  }
+  profile = candidate;
+  return true;
+}
+
+void BathroomContextNullCalibration::applyPersistedProfile(
+    const PersistedProfile& profile) {
+  for (size_t context = 0U; context < kContextCount; ++context) {
+    for (size_t feature = 0U; feature < kFeatureCount; ++feature) {
+      profiles_[context][feature].mean =
+          profile.statistics[context][feature].mean;
+      profiles_[context][feature].variance =
+          profile.statistics[context][feature].variance;
+      profiles_[context][feature].samples =
+          profile.statistics[context][feature].samples;
+    }
+  }
+}
+
+BathroomContextNullCalibration::PersistedProfile
+BathroomContextNullCalibration::makePersistedProfile(
+    uint32_t generation) const {
+  PersistedProfile profile{};
+  profile.magic = kProfileMagic;
+  profile.format_version = kProfileFormatVersion;
+  profile.structure_size = sizeof(PersistedProfile);
+  profile.generation = generation;
+  for (size_t context = 0U; context < kContextCount; ++context) {
+    for (size_t feature = 0U; feature < kFeatureCount; ++feature) {
+      profile.statistics[context][feature].mean =
+          profiles_[context][feature].mean;
+      profile.statistics[context][feature].variance =
+          profiles_[context][feature].variance;
+      profile.statistics[context][feature].samples =
+          profiles_[context][feature].samples;
+    }
+  }
+  profile.crc32 = calculateCrc32(
+      reinterpret_cast<const uint8_t*>(&profile),
+      offsetof(PersistedProfile, crc32));
+  return profile;
+}
+
+void BathroomContextNullCalibration::ensureStorageLoaded() {
+  if (storage_initialized_) {
+    return;
+  }
+  storage_initialized_ = true;
+  Preferences preferences;
+  if (!preferences.begin(kStorageNamespace, true)) {
+    storage_available_ = false;
+    checkpoint_ok_ = false;
+    return;
+  }
+  storage_available_ = true;
+
+  PersistedProfile slot_a{};
+  PersistedProfile slot_b{};
+  const bool slot_a_valid = readSlot(preferences, kSlotAKey, slot_a);
+  const bool slot_b_valid = readSlot(preferences, kSlotBKey, slot_b);
+  preferences.end();
+
+  if (!slot_a_valid && !slot_b_valid) {
+    checkpoint_ok_ = true;
+    return;
+  }
+
+  const bool select_b =
+      slot_b_valid &&
+      (!slot_a_valid ||
+       generationIsNewer(slot_b.generation, slot_a.generation));
+  const PersistedProfile& selected = select_b ? slot_b : slot_a;
+  applyPersistedProfile(selected);
+  profile_generation_ = selected.generation;
+  active_slot_ = select_b ? 1U : 0U;
+  persisted_profile_loaded_ = true;
+  recovered_from_single_slot_ = slot_a_valid != slot_b_valid;
+  checkpoint_ok_ = true;
+}
+
+bool BathroomContextNullCalibration::checkpointIfDue(
+    uint64_t observed_at_us) {
+  if (last_checkpoint_attempt_at_us_ == 0U) {
+    last_checkpoint_attempt_at_us_ = observed_at_us;
+    if (persisted_profile_loaded_) {
+      last_checkpoint_at_us_ = observed_at_us;
+    }
+    return checkpoint_ok_;
+  }
+  if (!profile_dirty_ ||
+      updates_since_checkpoint_ < config_.minimum_checkpoint_updates ||
+      elapsedMilliseconds(observed_at_us,
+                          last_checkpoint_attempt_at_us_) <
+          config_.checkpoint_interval_ms) {
+    return checkpoint_ok_;
+  }
+  last_checkpoint_attempt_at_us_ = observed_at_us;
+
+  const uint32_t next_generation = profile_generation_ + 1U;
+  const PersistedProfile candidate =
+      makePersistedProfile(next_generation);
+  const uint8_t target_slot = active_slot_ == 0U ? 1U : 0U;
+  const char* target_key =
+      target_slot == 0U ? kSlotAKey : kSlotBKey;
+
+  Preferences preferences;
+  if (!preferences.begin(kStorageNamespace, false)) {
+    storage_available_ = false;
+    checkpoint_ok_ = false;
+    return false;
+  }
+  storage_available_ = true;
+  const bool write_ok =
+      preferences.putBytes(target_key, &candidate, sizeof(candidate)) ==
+      sizeof(candidate);
+  PersistedProfile verified{};
+  const bool verify_ok =
+      write_ok && readSlot(preferences, target_key, verified) &&
+      verified.generation == next_generation;
+  preferences.end();
+  checkpoint_ok_ = verify_ok;
+  if (!verify_ok) {
+    return false;
+  }
+
+  active_slot_ = target_slot;
+  profile_generation_ = next_generation;
+  updates_since_checkpoint_ = 0U;
+  profile_dirty_ = false;
+  persisted_profile_loaded_ = true;
+  recovered_from_single_slot_ = false;
+  last_checkpoint_at_us_ = observed_at_us;
+  return true;
+}
+
 BathroomContextNullCalibrationUpdateStatus
 BathroomContextNullCalibration::update(
     const BathroomCsiEvidence& csi,
@@ -321,11 +542,23 @@ BathroomContextNullCalibration::update(
     return BathroomContextNullCalibrationUpdateStatus::StaleObservation;
   }
 
+  ensureStorageLoaded();
+  const bool replacing_current_probe =
+      has_current_probe_ &&
+      integrated.probe_sequence == current_probe_sequence_;
+  if (!replacing_current_probe) {
+    checkpointIfDue(integrated.observed_at_us);
+  }
+
   if (has_current_probe_ &&
       integrated.probe_sequence == current_probe_sequence_) {
     copyProfiles(profiles_, before_current_probe_);
+    updates_since_checkpoint_ = before_current_probe_updates_;
+    profile_dirty_ = before_current_probe_dirty_;
   } else {
     copyProfiles(before_current_probe_, profiles_);
+    before_current_probe_updates_ = updates_since_checkpoint_;
+    before_current_probe_dirty_ = profile_dirty_;
     current_probe_sequence_ = integrated.probe_sequence;
     has_current_probe_ = true;
   }
@@ -358,6 +591,10 @@ BathroomContextNullCalibration::update(
       updateStatistic(profiles_[selected_context][feature],
                       raw_values[feature]);
     }
+    if (updates_since_checkpoint_ < UINT32_MAX) {
+      ++updates_since_checkpoint_;
+    }
+    profile_dirty_ = true;
   }
 
   output = {};
@@ -429,10 +666,20 @@ BathroomContextNullCalibration::update(
                      output.calibrated_overall_risk,
                      output.calibration_applied, danger_lock);
   output.update_quality = update_quality;
+  output.profile_generation = profile_generation_;
+  output.updates_since_checkpoint = updates_since_checkpoint_;
+  output.checkpoint_age_ms =
+      elapsedMilliseconds(integrated.observed_at_us,
+                          last_checkpoint_at_us_);
   output.null_update_allowed = update_allowed;
   output.null_profile_updated = update_allowed;
   output.danger_lock = danger_lock;
   output.physically_observable = integrated.physically_observable;
+  output.storage_available = storage_available_;
+  output.persisted_profile_loaded = persisted_profile_loaded_;
+  output.recovered_from_single_slot = recovered_from_single_slot_;
+  output.profile_dirty = profile_dirty_;
+  output.checkpoint_ok = checkpoint_ok_;
   output.evidence_ready = true;
 
   last_observed_at_us_ = integrated.observed_at_us;
@@ -468,6 +715,11 @@ void BathroomContextNullCalibration::emitIfDue(
       "\"samples\":%lu},"
       "\"raw_risk\":%.3f,\"calibrated_risk\":%.3f,"
       "\"explained_context_risk\":%.3f,\"maturity\":%.3f,"
+      "\"profile_generation\":%lu,\"updates_since_checkpoint\":%lu,"
+      "\"checkpoint_age_ms\":%lu,\"storage_available\":%s,"
+      "\"persisted_profile_loaded\":%s,"
+      "\"recovered_from_single_slot\":%s,\"profile_dirty\":%s,"
+      "\"checkpoint_ok\":%s,"
       "\"update_allowed\":%s,\"updated\":%s,\"applied\":%s,"
       "\"danger_lock\":%s,\"quality\":%.3f,\"ready\":true}\r\n",
       static_cast<unsigned long>(evidence.probe_sequence),
@@ -506,6 +758,14 @@ void BathroomContextNullCalibration::emitIfDue(
       static_cast<unsigned long>(evidence.occupied_unknown.samples),
       evidence.raw_overall_risk, evidence.calibrated_overall_risk,
       evidence.explained_context_risk, evidence.profile_maturity,
+      static_cast<unsigned long>(evidence.profile_generation),
+      static_cast<unsigned long>(evidence.updates_since_checkpoint),
+      static_cast<unsigned long>(evidence.checkpoint_age_ms),
+      evidence.storage_available ? "true" : "false",
+      evidence.persisted_profile_loaded ? "true" : "false",
+      evidence.recovered_from_single_slot ? "true" : "false",
+      evidence.profile_dirty ? "true" : "false",
+      evidence.checkpoint_ok ? "true" : "false",
       evidence.null_update_allowed ? "true" : "false",
       evidence.null_profile_updated ? "true" : "false",
       evidence.calibration_applied ? "true" : "false",
@@ -520,10 +780,23 @@ void BathroomContextNullCalibration::reset() {
       before_current_probe_[context][feature] = {};
     }
   }
+  before_current_probe_updates_ = 0U;
+  before_current_probe_dirty_ = false;
   current_probe_sequence_ = 0U;
   last_observed_at_us_ = 0U;
   last_emit_at_us_ = 0U;
+  last_checkpoint_at_us_ = 0U;
+  last_checkpoint_attempt_at_us_ = 0U;
+  profile_generation_ = 0U;
+  updates_since_checkpoint_ = 0U;
+  active_slot_ = 0U;
   has_current_probe_ = false;
+  storage_initialized_ = false;
+  storage_available_ = false;
+  persisted_profile_loaded_ = false;
+  recovered_from_single_slot_ = false;
+  profile_dirty_ = false;
+  checkpoint_ok_ = false;
 }
 
 }  // namespace atom::radar
