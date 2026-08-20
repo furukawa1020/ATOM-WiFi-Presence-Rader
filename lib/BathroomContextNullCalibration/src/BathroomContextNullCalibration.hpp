@@ -28,7 +28,14 @@ struct BathroomContextNullCalibrationConfig {
   float tail_start_sigma = 2.5F;
   float maximum_evidence_reduction = 0.30F;
   float danger_lock_memory = 0.55F;
+  float drift_warning_score = 2.20F;
+  float drift_quarantine_score = 3.50F;
+  float drift_ewma_alpha = 0.12F;
+  float shadow_stability_score = 2.00F;
   uint32_t mature_sample_count = 48U;
+  uint32_t drift_quarantine_samples = 30U;
+  uint32_t shadow_rebaseline_samples = 96U;
+  uint32_t shadow_stability_samples = 20U;
   uint32_t maximum_sample_count = 65535U;
   uint32_t minimum_checkpoint_updates = 32U;
   uint32_t checkpoint_interval_ms = 5U * 60U * 1000U;
@@ -74,6 +81,13 @@ class BathroomContextNullCalibration {
     uint32_t samples = 0U;
   };
 
+  struct DriftContextState {
+    float drift_score = 0.0F;
+    uint32_t consecutive_drift_samples = 0U;
+    uint32_t shadow_stable_samples = 0U;
+    bool quarantined = false;
+  };
+
   struct __attribute__((packed)) PersistedStatistic {
     float mean;
     float variance;
@@ -110,6 +124,31 @@ class BathroomContextNullCalibration {
       const BathroomBathingSessionEvidence& session,
       const BathroomIntegratedSafetyEvidence& integrated,
       float update_quality) const;
+  bool driftObservationGate(
+      BathroomNullContext context,
+      float context_confidence,
+      const BathroomCsiEvidence& csi,
+      const BathroomSafetyEvidence& safety,
+      const BathroomRespirationEvidence& respiration,
+      const BathroomBathingSessionEvidence& session,
+      const BathroomIntegratedSafetyEvidence& integrated,
+      float update_quality) const;
+  bool shadowUpdateGate(
+      BathroomNullContext context,
+      const BathroomCsiEvidence& csi,
+      const BathroomSafetyEvidence& safety,
+      const BathroomRespirationEvidence& respiration,
+      const BathroomBathingSessionEvidence& session,
+      const BathroomIntegratedSafetyEvidence& integrated) const;
+  bool profileMature(
+      const NullStatistic profile[kFeatureCount],
+      uint32_t required_samples) const;
+  float profileDistance(
+      const float values[kFeatureCount],
+      const NullStatistic profile[kFeatureCount]) const;
+  uint32_t profileMinimumSamples(
+      const NullStatistic profile[kFeatureCount]) const;
+  void clearShadowContext(size_t context);
   void updateStatistic(NullStatistic& statistic, float value);
   BathroomNullCalibratedFeature calibrateFeature(
       float raw,
@@ -139,6 +178,10 @@ class BathroomContextNullCalibration {
   BathroomContextNullCalibrationConfig config_;
   NullStatistic profiles_[kContextCount][kFeatureCount]{};
   NullStatistic before_current_probe_[kContextCount][kFeatureCount]{};
+  NullStatistic shadow_profiles_[kContextCount][kFeatureCount]{};
+  NullStatistic before_current_probe_shadow_[kContextCount][kFeatureCount]{};
+  DriftContextState drift_states_[kContextCount]{};
+  DriftContextState before_current_probe_drift_[kContextCount]{};
   uint32_t before_current_probe_updates_ = 0U;
   bool before_current_probe_dirty_ = false;
   uint32_t current_probe_sequence_ = 0U;
