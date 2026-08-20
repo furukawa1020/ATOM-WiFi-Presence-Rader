@@ -212,6 +212,119 @@ bool BathroomContextNullCalibration::safeUpdateGate(
          respiration.stable_respiration_evidence >= 0.45F;
 }
 
+bool BathroomContextNullCalibration::driftObservationGate(
+    BathroomNullContext context,
+    float context_confidence,
+    const BathroomCsiEvidence& csi,
+    const BathroomSafetyEvidence& safety,
+    const BathroomRespirationEvidence& respiration,
+    const BathroomBathingSessionEvidence& session,
+    const BathroomIntegratedSafetyEvidence& integrated,
+    float update_quality) const {
+  if (context == BathroomNullContext::Unknown ||
+      context_confidence < config_.minimum_context_confidence ||
+      update_quality < config_.minimum_update_quality ||
+      !integrated.physically_observable ||
+      dangerRank(integrated.safety_level) >
+          dangerRank(BathroomIntegratedSafetyLevel::CheckRequired) ||
+      integrated.stale_danger_memory >= 0.45F ||
+      integrated.prolonged_bathing_evidence >= 0.15F ||
+      integrated.measurement_failure_evidence >= 0.35F ||
+      safety.impact_evidence >= 0.18F ||
+      safety.fall_sequence_evidence >= 0.22F ||
+      safety.dangerous_immobility_evidence >= 0.25F ||
+      respiration.measurement_loss_alternative >= 0.30F) {
+    return false;
+  }
+  if (context == BathroomNullContext::EmptyRoom) {
+    return session.vacant_probability >= 0.70F &&
+           csi.human_motion_evidence <= 0.25F;
+  }
+  if (context == BathroomNullContext::OccupiedQuiet) {
+    return session.occupancy_evidence >= 0.55F &&
+           respiration.stable_respiration_evidence >= 0.45F &&
+           csi.human_motion_evidence <= 0.42F;
+  }
+  return session.vacant_probability >= 0.60F ||
+         respiration.stable_respiration_evidence >= 0.45F;
+}
+
+bool BathroomContextNullCalibration::shadowUpdateGate(
+    BathroomNullContext context,
+    const BathroomCsiEvidence& csi,
+    const BathroomSafetyEvidence& safety,
+    const BathroomRespirationEvidence& respiration,
+    const BathroomBathingSessionEvidence& session,
+    const BathroomIntegratedSafetyEvidence& integrated) const {
+  if (dangerRank(integrated.safety_level) >
+          dangerRank(BathroomIntegratedSafetyLevel::Attention) ||
+      integrated.floor_fall_evidence >= 0.26F ||
+      integrated.bathtub_immobility_evidence >= 0.30F ||
+      integrated.dangerous_posture_evidence >= 0.30F ||
+      integrated.respiratory_motion_loss_evidence >= 0.25F ||
+      integrated.stale_danger_memory >= 0.35F ||
+      safety.impact_evidence >= 0.15F ||
+      safety.dangerous_immobility_evidence >= 0.22F) {
+    return false;
+  }
+  if (context == BathroomNullContext::EmptyRoom) {
+    return session.vacant_probability >= 0.75F &&
+           csi.human_motion_evidence <= 0.20F;
+  }
+  if (context == BathroomNullContext::OccupiedQuiet) {
+    return session.occupancy_evidence >= 0.60F &&
+           respiration.stable_respiration_evidence >= 0.55F &&
+           csi.human_motion_evidence <= 0.35F;
+  }
+  return session.vacant_probability >= 0.65F ||
+         respiration.stable_respiration_evidence >= 0.55F;
+}
+
+bool BathroomContextNullCalibration::profileMature(
+    const NullStatistic profile[kFeatureCount],
+    uint32_t required_samples) const {
+  for (size_t feature = 0U; feature < kFeatureCount; ++feature) {
+    if (profile[feature].samples < required_samples) {
+      return false;
+    }
+  }
+  return true;
+}
+
+float BathroomContextNullCalibration::profileDistance(
+    const float values[kFeatureCount],
+    const NullStatistic profile[kFeatureCount]) const {
+  float normalized_residuals[kFeatureCount]{};
+  for (size_t feature = 0U; feature < kFeatureCount; ++feature) {
+    const float scale = std::sqrt(maximum(
+        profile[feature].variance,
+        config_.scale_floor * config_.scale_floor));
+    normalized_residuals[feature] =
+        std::clamp(std::fabs(values[feature] - profile[feature].mean) /
+                       scale,
+                   0.0F, 12.0F);
+  }
+  std::sort(normalized_residuals,
+            normalized_residuals + kFeatureCount);
+  return normalized_residuals[kFeatureCount / 2U];
+}
+
+uint32_t BathroomContextNullCalibration::profileMinimumSamples(
+    const NullStatistic profile[kFeatureCount]) const {
+  uint32_t samples = UINT32_MAX;
+  for (size_t feature = 0U; feature < kFeatureCount; ++feature) {
+    samples = std::min(samples, profile[feature].samples);
+  }
+  return samples == UINT32_MAX ? 0U : samples;
+}
+
+void BathroomContextNullCalibration::clearShadowContext(size_t context) {
+  for (size_t feature = 0U; feature < kFeatureCount; ++feature) {
+    shadow_profiles_[context][feature] = {};
+  }
+  drift_states_[context].shadow_stable_samples = 0U;
+}
+
 void BathroomContextNullCalibration::updateStatistic(
     NullStatistic& statistic,
     float value) {
@@ -553,10 +666,18 @@ BathroomContextNullCalibration::update(
   if (has_current_probe_ &&
       integrated.probe_sequence == current_probe_sequence_) {
     copyProfiles(profiles_, before_current_probe_);
+    copyProfiles(shadow_profiles_, before_current_probe_shadow_);
+    for (size_t index = 0U; index < kContextCount; ++index) {
+      drift_states_[index] = before_current_probe_drift_[index];
+    }
     updates_since_checkpoint_ = before_current_probe_updates_;
     profile_dirty_ = before_current_probe_dirty_;
   } else {
     copyProfiles(before_current_probe_, profiles_);
+    copyProfiles(before_current_probe_shadow_, shadow_profiles_);
+    for (size_t index = 0U; index < kContextCount; ++index) {
+      before_current_probe_drift_[index] = drift_states_[index];
+    }
     before_current_probe_updates_ = updates_since_checkpoint_;
     before_current_probe_dirty_ = profile_dirty_;
     current_probe_sequence_ = integrated.probe_sequence;
@@ -574,7 +695,7 @@ BathroomContextNullCalibration::update(
       dangerRank(integrated.safety_level) >=
           dangerRank(BathroomIntegratedSafetyLevel::Urgent) ||
       integrated.stale_danger_memory >= config_.danger_lock_memory;
-  const bool update_allowed =
+  const bool base_update_allowed =
       safeUpdateGate(context, context_confidence, csi, safety, respiration,
                      session, integrated, update_quality);
 
@@ -586,6 +707,53 @@ BathroomContextNullCalibration::update(
       integrated.occupied_unknown_evidence,
   };
   const size_t selected_context = contextIndex(context);
+  DriftContextState& drift_state = drift_states_[selected_context];
+  const bool drift_monitor_allowed =
+      driftObservationGate(context, context_confidence, csi, safety,
+                           respiration, session, integrated, update_quality) &&
+      profileMature(profiles_[selected_context],
+                    config_.mature_sample_count) &&
+      !danger_lock;
+  bool entered_quarantine = false;
+  if (drift_monitor_allowed) {
+    const float distance =
+        profileDistance(raw_values, profiles_[selected_context]);
+    drift_state.drift_score = clamp01(
+        drift_state.drift_score +
+        config_.drift_ewma_alpha *
+            (minimum(distance, 1.0F) - drift_state.drift_score));
+    const float scaled_drift_score =
+        drift_state.drift_score * 12.0F;
+    if (scaled_drift_score >= config_.drift_quarantine_score) {
+      if (drift_state.consecutive_drift_samples < UINT32_MAX) {
+        ++drift_state.consecutive_drift_samples;
+      }
+    } else if (scaled_drift_score < config_.drift_warning_score) {
+      drift_state.consecutive_drift_samples = 0U;
+    }
+    if (!drift_state.quarantined &&
+        drift_state.consecutive_drift_samples >=
+            config_.drift_quarantine_samples) {
+      drift_state.quarantined = true;
+      entered_quarantine = true;
+      clearShadowContext(selected_context);
+    }
+  } else if (!danger_lock && !drift_state.quarantined) {
+    drift_state.drift_score *= 0.995F;
+    if (drift_state.drift_score * 12.0F <
+        config_.drift_warning_score) {
+      drift_state.consecutive_drift_samples = 0U;
+    }
+  }
+
+  const float reported_drift_score =
+      drift_state.drift_score * 12.0F;
+  const bool drift_warning =
+      reported_drift_score >= config_.drift_warning_score;
+  const bool calibration_suspended =
+      drift_warning || drift_state.quarantined;
+  const bool update_allowed =
+      base_update_allowed && !calibration_suspended;
   if (update_allowed) {
     for (size_t feature = 0U; feature < kFeatureCount; ++feature) {
       updateStatistic(profiles_[selected_context][feature],
@@ -597,6 +765,53 @@ BathroomContextNullCalibration::update(
     profile_dirty_ = true;
   }
 
+  const bool shadow_update_allowed =
+      drift_state.quarantined && drift_monitor_allowed &&
+      shadowUpdateGate(context, csi, safety, respiration, session,
+                       integrated);
+  bool rebaseline_accepted = false;
+  uint32_t shadow_samples =
+      profileMinimumSamples(shadow_profiles_[selected_context]);
+  uint32_t shadow_stable_samples =
+      drift_state.shadow_stable_samples;
+  if (shadow_update_allowed) {
+    for (size_t feature = 0U; feature < kFeatureCount; ++feature) {
+      updateStatistic(shadow_profiles_[selected_context][feature],
+                      raw_values[feature]);
+    }
+    shadow_samples =
+        profileMinimumSamples(shadow_profiles_[selected_context]);
+    if (profileMature(shadow_profiles_[selected_context],
+                      config_.shadow_rebaseline_samples)) {
+      const float shadow_distance =
+          profileDistance(raw_values,
+                          shadow_profiles_[selected_context]);
+      if (shadow_distance <= config_.shadow_stability_score) {
+        if (drift_state.shadow_stable_samples < UINT32_MAX) {
+          ++drift_state.shadow_stable_samples;
+        }
+      } else {
+        drift_state.shadow_stable_samples = 0U;
+      }
+    }
+    shadow_stable_samples = drift_state.shadow_stable_samples;
+    if (shadow_samples >= config_.shadow_rebaseline_samples &&
+        drift_state.shadow_stable_samples >=
+            config_.shadow_stability_samples) {
+      for (size_t feature = 0U; feature < kFeatureCount; ++feature) {
+        profiles_[selected_context][feature] =
+            shadow_profiles_[selected_context][feature];
+      }
+      drift_state = {};
+      clearShadowContext(selected_context);
+      updates_since_checkpoint_ = std::max(
+          updates_since_checkpoint_,
+          config_.minimum_checkpoint_updates);
+      profile_dirty_ = true;
+      rebaseline_accepted = true;
+    }
+  }
+
   output = {};
   output.probe_sequence = integrated.probe_sequence;
   output.observed_at_us = integrated.observed_at_us;
@@ -606,27 +821,27 @@ BathroomContextNullCalibration::update(
       raw_values[static_cast<size_t>(FeatureIndex::FloorFall)],
       profiles_[selected_context]
                [static_cast<size_t>(FeatureIndex::FloorFall)],
-      danger_lock);
+      danger_lock || calibration_suspended);
   output.bathtub_immobility = calibrateFeature(
       raw_values[static_cast<size_t>(FeatureIndex::BathtubImmobility)],
       profiles_[selected_context]
                [static_cast<size_t>(FeatureIndex::BathtubImmobility)],
-      danger_lock);
+      danger_lock || calibration_suspended);
   output.dangerous_posture = calibrateFeature(
       raw_values[static_cast<size_t>(FeatureIndex::DangerousPosture)],
       profiles_[selected_context]
                [static_cast<size_t>(FeatureIndex::DangerousPosture)],
-      danger_lock);
+      danger_lock || calibration_suspended);
   output.respiratory_motion_loss = calibrateFeature(
       raw_values[static_cast<size_t>(FeatureIndex::RespiratoryMotionLoss)],
       profiles_[selected_context]
                [static_cast<size_t>(FeatureIndex::RespiratoryMotionLoss)],
-      danger_lock);
+      danger_lock || calibration_suspended);
   output.occupied_unknown = calibrateFeature(
       raw_values[static_cast<size_t>(FeatureIndex::OccupiedUnknown)],
       profiles_[selected_context]
                [static_cast<size_t>(FeatureIndex::OccupiedUnknown)],
-      danger_lock);
+      danger_lock || calibration_suspended);
   output.prolonged_bathing_evidence =
       integrated.prolonged_bathing_evidence;
   output.raw_overall_risk = integrated.overall_risk;
@@ -639,7 +854,8 @@ BathroomContextNullCalibration::update(
                               output.occupied_unknown.maturity))));
   output.calibration_applied =
       output.profile_maturity >= 1.0F &&
-      context != BathroomNullContext::Unknown && !danger_lock;
+      context != BathroomNullContext::Unknown && !danger_lock &&
+      !calibration_suspended;
 
   const float calibrated_instant = maximum(
       output.floor_fall.calibrated_evidence * 0.95F,
@@ -656,7 +872,7 @@ BathroomContextNullCalibration::update(
       integrated.overall_risk *
       (1.0F - 0.25F * output.profile_maturity);
   output.calibrated_overall_risk =
-      danger_lock
+      (danger_lock || calibration_suspended)
           ? integrated.overall_risk
           : clamp01(maximum(calibrated_instant, retained_raw_risk));
   output.explained_context_risk =
@@ -664,8 +880,21 @@ BathroomContextNullCalibration::update(
   output.recommended_level =
       recommendLevel(integrated.safety_level,
                      output.calibrated_overall_risk,
-                     output.calibration_applied, danger_lock);
+                     output.calibration_applied,
+                     danger_lock || calibration_suspended);
   output.update_quality = update_quality;
+  output.profile_drift_score =
+      rebaseline_accepted ? 0.0F : reported_drift_score;
+  output.shadow_profile_samples = shadow_samples;
+  output.shadow_profile_maturity =
+      config_.shadow_rebaseline_samples == 0U
+          ? 1.0F
+          : clamp01(static_cast<float>(shadow_samples) /
+                    static_cast<float>(
+                        config_.shadow_rebaseline_samples));
+  output.drift_consecutive_samples =
+      drift_state.consecutive_drift_samples;
+  output.shadow_stable_samples = shadow_stable_samples;
   output.profile_generation = profile_generation_;
   output.updates_since_checkpoint = updates_since_checkpoint_;
   output.checkpoint_age_ms =
@@ -675,6 +904,13 @@ BathroomContextNullCalibration::update(
   output.null_profile_updated = update_allowed;
   output.danger_lock = danger_lock;
   output.physically_observable = integrated.physically_observable;
+  output.drift_monitor_allowed = drift_monitor_allowed;
+  output.drift_warning =
+      !rebaseline_accepted && drift_warning;
+  output.context_quarantined =
+      !rebaseline_accepted && drift_state.quarantined;
+  output.shadow_update_allowed = shadow_update_allowed;
+  output.rebaseline_accepted = rebaseline_accepted;
   output.storage_available = storage_available_;
   output.persisted_profile_loaded = persisted_profile_loaded_;
   output.recovered_from_single_slot = recovered_from_single_slot_;
@@ -720,6 +956,11 @@ void BathroomContextNullCalibration::emitIfDue(
       "\"persisted_profile_loaded\":%s,"
       "\"recovered_from_single_slot\":%s,\"profile_dirty\":%s,"
       "\"checkpoint_ok\":%s,"
+      "\"drift_score\":%.3f,\"drift_consecutive\":%lu,"
+      "\"drift_monitor_allowed\":%s,\"drift_warning\":%s,"
+      "\"context_quarantined\":%s,\"shadow_update_allowed\":%s,"
+      "\"shadow_samples\":%lu,\"shadow_maturity\":%.3f,"
+      "\"shadow_stable_samples\":%lu,\"rebaseline_accepted\":%s,"
       "\"update_allowed\":%s,\"updated\":%s,\"applied\":%s,"
       "\"danger_lock\":%s,\"quality\":%.3f,\"ready\":true}\r\n",
       static_cast<unsigned long>(evidence.probe_sequence),
@@ -766,6 +1007,17 @@ void BathroomContextNullCalibration::emitIfDue(
       evidence.recovered_from_single_slot ? "true" : "false",
       evidence.profile_dirty ? "true" : "false",
       evidence.checkpoint_ok ? "true" : "false",
+      evidence.profile_drift_score,
+      static_cast<unsigned long>(
+          evidence.drift_consecutive_samples),
+      evidence.drift_monitor_allowed ? "true" : "false",
+      evidence.drift_warning ? "true" : "false",
+      evidence.context_quarantined ? "true" : "false",
+      evidence.shadow_update_allowed ? "true" : "false",
+      static_cast<unsigned long>(evidence.shadow_profile_samples),
+      evidence.shadow_profile_maturity,
+      static_cast<unsigned long>(evidence.shadow_stable_samples),
+      evidence.rebaseline_accepted ? "true" : "false",
       evidence.null_update_allowed ? "true" : "false",
       evidence.null_profile_updated ? "true" : "false",
       evidence.calibration_applied ? "true" : "false",
@@ -778,7 +1030,11 @@ void BathroomContextNullCalibration::reset() {
     for (size_t feature = 0U; feature < kFeatureCount; ++feature) {
       profiles_[context][feature] = {};
       before_current_probe_[context][feature] = {};
+      shadow_profiles_[context][feature] = {};
+      before_current_probe_shadow_[context][feature] = {};
     }
+    drift_states_[context] = {};
+    before_current_probe_drift_[context] = {};
   }
   before_current_probe_updates_ = 0U;
   before_current_probe_dirty_ = false;
